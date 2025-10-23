@@ -110,7 +110,7 @@ Step 1. Exploration First (2–3 probes only)
 • “Do you think the bigger difficulty is adjusting to changes, or how you’re experiencing the situation emotionally?”
 • “Which part feels within your control, and which feels outside of it?”
 
-Step 2. Decide on a Framework
+Step 2. Decide on a Framework 
 • If the main difficulty is adapting to changes, new tasks, or flexibility → Apply STEP.
 • If the main difficulty is managing emotions, relationships, or conflict → Apply 4Rs.
 • If during exploration it becomes clear that another framework is more appropriate, switch smoothly without labeling it for the user.
