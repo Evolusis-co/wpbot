@@ -110,7 +110,7 @@ Step 1. Exploration First (2–3 probes only)
 • “Do you think the bigger difficulty is adjusting to changes, or how you’re experiencing the situation emotionally?”
 • “Which part feels within your control, and which feels outside of it?”
 
-Step 2. Decide on a Framework 
+Step 2. Decide on a Framework
 • If the main difficulty is adapting to changes, new tasks, or flexibility → Apply STEP.
 • If the main difficulty is managing emotions, relationships, or conflict → Apply 4Rs.
 • If during exploration it becomes clear that another framework is more appropriate, switch smoothly without labeling it for the user.
@@ -172,7 +172,6 @@ Good Examples (Concise, Natural):
 ✅ "Yeah, that would stress anyone out. What part feels hardest for you?"
 ✅ "I get why you're frustrated. Sounds like your manager's style is really different from what you're used to."
 ✅ "That's a tough spot to be in. Would it help to work through a method for handling situations like this?"
-✅ "It's called the 4Rs framework. You've already done RECOGNIZE - you know this pattern triggers stress. Now REGULATE - when they hand you work at 5pm, what could help you stay calm?"
 User: "my boss keeps giving me work right when i'm about to leave"
 AI: "That's super frustrating. Does this happen a lot?"
 AI: "Sounds like a pattern. What's the main issue for you - the extra work or the timing?"
@@ -227,7 +226,6 @@ except Exception as e:
 # Conversation memory and tone preferences
 conversation_memory = {}
 tone_preferences = {}  # maps user_id -> "professional" | "casual"
-pending_tone_requests = set()  # phone numbers awaiting tone reply
 
 def generate_reply_for_input(user_id: str, user_input: str) -> str:
     tone = tone_preferences.get(user_id)
@@ -269,45 +267,65 @@ def _basic_auth_header(auth: tuple):
     token = base64.b64encode(f"{user}:{passwd}".encode()).decode()
     return {"Authorization": f"Basic {token}"}
 
-# ... download_media, convert_to_mp3, transcribe_with_openai unchanged ...
-# For brevity in this canvas we include them unchanged from prior version
-
 def download_media(url: str, dest_path: str, auth: tuple = None, timeout: int = 30):
+    """
+    Multi-strategy media downloader:
+     - try unauthenticated GET (some providers return public link)
+     - try GET with Authorization header preserved across redirects
+     - manual redirect-follow with requests.get(..., auth=auth) on each hop
+     - try Twilio /Content endpoint fallback
+    Raises requests.HTTPError on failure.
+    """
     logger.debug("download_media called for %s (auth=%s)", url, bool(auth))
+
+    # Strategy 1: simple unauthenticated GET (useful for Meta or public CDN links)
     try:
         r = requests.get(url, stream=True, timeout=10, allow_redirects=True)
+        logger.debug("Unauthenticated fetch status=%s headers=%s", r.status_code, dict(list(r.headers.items())[:5]))
         if 200 <= r.status_code < 300 and (r.headers.get("content-length") or r.content):
             with open(dest_path, "wb") as f:
                 for chunk in r.iter_content(10240):
                     if chunk:
                         f.write(chunk)
+            logger.debug("Saved media via unauthenticated fetch (%d bytes)", os.path.getsize(dest_path))
             return
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Unauthenticated fetch failed: %s", e)
+
+    # Strategy 2: GET with Basic Authorization header attached (some CDNs accept header)
     if auth:
         headers = _basic_auth_header(auth)
         try:
             r = requests.get(url, headers=headers, stream=True, timeout=15, allow_redirects=True)
+            logger.debug("Auth-header fetch status=%s headers=%s", r.status_code, dict(list(r.headers.items())[:5]))
             if 200 <= r.status_code < 300 and (r.headers.get("content-length") or r.content):
                 with open(dest_path, "wb") as f:
                     for chunk in r.iter_content(10240):
                         if chunk:
                             f.write(chunk)
+                logger.debug("Saved media via auth-header fetch (%d bytes)", os.path.getsize(dest_path))
                 return
-        except Exception:
-            pass
+            else:
+                logger.warning("Auth-header fetch returned non-2xx: %s. body-snippet=%s", r.status_code, (r.content[:256] if r.content else b""))
+        except Exception as e:
+            logger.debug("Auth-header fetch failed: %s", e)
+
+    # Strategy 3: manual redirect-follow with auth on each hop (preserve HTTP Basic auth)
     if auth:
         try:
             current = url
             hops = 0
             max_hops = 8
             while hops < max_hops:
+                logger.debug("Manual-auth hop %s -> %s", hops, current)
                 r = requests.get(current, auth=auth, stream=True, timeout=15, allow_redirects=False)
+                logger.debug("  status=%s headers=%s", r.status_code, dict(list(r.headers.items())[:5]))
                 if 200 <= r.status_code < 300:
                     with open(dest_path, "wb") as f:
                         for chunk in r.iter_content(10240):
                             if chunk:
                                 f.write(chunk)
+                    logger.debug("Saved media via manual-auth fetch (%d bytes)", os.path.getsize(dest_path))
                     return
                 if r.is_redirect or r.is_permanent_redirect:
                     loc = r.headers.get("Location") or r.headers.get("location")
@@ -320,49 +338,65 @@ def download_media(url: str, dest_path: str, auth: tuple = None, timeout: int = 
                         current = loc
                     hops += 1
                     continue
+                logger.warning("Manual-auth fetch non-2xx and not redirect: status=%s body-snippet=%s", r.status_code, (r.content[:256] if r.content else b""))
                 r.raise_for_status()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.exception("Manual-auth fetch failed: %s", e)
+
+    # Strategy 4: Twilio media Content endpoint fallback (append /Content)
     try:
         parsed = urlparse(url)
         if "api.twilio.com" in parsed.netloc and auth:
             alt = url
             if not parsed.path.endswith("/Content"):
                 alt = f"{url}/Content"
+            logger.debug("Trying Twilio Content endpoint: %s", alt)
             r = requests.get(alt, auth=auth, stream=True, timeout=15, allow_redirects=True)
+            logger.debug("Twilio Content fetch status=%s headers=%s", r.status_code, dict(list(r.headers.items())[:5]))
             if 200 <= r.status_code < 300 and (r.headers.get("content-length") or r.content):
                 with open(dest_path, "wb") as f:
                     for chunk in r.iter_content(10240):
                         if chunk:
                             f.write(chunk)
+                logger.debug("Saved media via Twilio Content endpoint (%d bytes)", os.path.getsize(dest_path))
                 return
-    except Exception:
-        pass
+            else:
+                logger.warning("Twilio Content fetch failed status=%s body-snippet=%s", r.status_code, (r.content[:256] if r.content else b""))
+    except Exception as e:
+        logger.debug("Twilio Content endpoint attempt failed: %s", e)
+
+    # All strategies exhausted -> raise
     raise requests.HTTPError(f"All media fetch strategies failed for {url}")
 
-
 def convert_to_mp3(input_path: str, output_path: str) -> None:
+    logger.debug("Converting %s -> %s using ffmpeg", input_path, output_path)
     cmd = ["ffmpeg", "-y", "-i", input_path, "-ar", "16000", "-ac", "1", "-b:a", "128k", output_path]
     subprocess.run(cmd, check=True)
-
+    logger.debug("Conversion complete: %s", output_path)
 
 def transcribe_with_openai(audio_file_path: str) -> str:
     if not openai_client:
+        logger.warning("OpenAI client not available for transcription")
         return ""
     try:
         with open(audio_file_path, "rb") as fh:
             resp = openai_client.audio.transcriptions.create(model="gpt-4o-transcribe", file=fh)
         text = resp.get("text") if isinstance(resp, dict) else getattr(resp, "text", None)
         if text:
+            logger.debug("Transcription (gpt-4o-transcribe) succeeded")
             return text
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("gpt-4o-transcribe failed or unavailable: %s", e)
+
     try:
         with open(audio_file_path, "rb") as fh:
             resp = openai_client.audio.transcriptions.create(model="whisper-1", file=fh)
         text = resp.get("text") if isinstance(resp, dict) else getattr(resp, "text", None)
+        if text:
+            logger.debug("Transcription (whisper-1) succeeded")
         return text or ""
-    except Exception:
+    except Exception as e:
+        logger.exception("Whisper transcription failed: %s", e)
         return ""
 
 # --- Meta WhatsApp helpers ---
@@ -378,25 +412,11 @@ def send_whatsapp_reaction(to_number: str, message_id: str, emoji: str, phone_nu
     headers = {"Authorization": f"Bearer {access_token}"}
     resp = requests.post(url, json=payload, headers=headers)
     resp.raise_for_status()
-
+    logger.debug("Sent reaction %s to %s for message %s", emoji, to_number, message_id)
 
 def should_react_with_heart(user_input: str) -> bool:
     triggers = ["hi", "hello", "hey", "my name is"]
     return any(trigger in user_input.lower() for trigger in triggers)
-
-
-def is_problem_statement(user_input: str) -> bool:
-    if not user_input:
-        return False
-    text = user_input.lower()
-    problem_triggers = ["problem", "issue", "help", "error", "can't", "cannot", "unable", "stuck", "not working", "fail", "failure", "bug", "having trouble"]
-    if any(t in text for t in problem_triggers):
-        return True
-    # If user writes a reasonably long descriptive message or asks a question, treat as problem
-    if len(text.split()) > 6 or "?" in text:
-        return True
-    return False
-
 
 def send_meta_text(to_number: str, text: str):
     url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
@@ -405,10 +425,9 @@ def send_meta_text(to_number: str, text: str):
     resp = requests.post(url, json=payload, headers=headers)
     try:
         resp.raise_for_status()
-    except Exception:
-        logger.exception("Error sending meta text: %s -- response: %s", resp.text if resp is not None else None)
+    except Exception as e:
+        logger.exception("Error sending meta text: %s -- response: %s", e, resp.text if resp is not None else None)
     return resp
-
 
 def send_meta_interactive_tone_choice(to_number: str):
     url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
@@ -431,8 +450,8 @@ def send_meta_interactive_tone_choice(to_number: str):
     resp = requests.post(url, json=payload, headers=headers)
     try:
         resp.raise_for_status()
-    except Exception:
-        logger.exception("Error sending meta interactive: %s -- response: %s", resp.text if resp is not None else None)
+    except Exception as e:
+        logger.exception("Error sending meta interactive: %s -- response: %s", e, resp.text if resp is not None else None)
     return resp
 
 # --- Flask app ---
@@ -460,25 +479,58 @@ def whatsapp_webhook():
 
         user_input = None
         if num_media > 0:
-            # media handling (unchanged)
             media_url = request.form.get("MediaUrl0")
-            media_ct = request.form.get("MediaContentType0", "")
+            media_ct = request.form.get("MediaContentType0", "")  # e.g. audio/ogg, audio/mpeg
+            logger.debug("Incoming Twilio media: url=%s content-type=%s", media_url, media_ct)
+
+            # quick account-match diagnostic: ensure media_url account matches TWILIO_ACCOUNT_SID
+            try:
+                if media_url and TWILIO_ACCOUNT_SID and f"/Accounts/{TWILIO_ACCOUNT_SID}/" not in media_url:
+                    logger.warning("Media URL account mismatch: media_url=%s, expected account sid=%s", media_url, TWILIO_ACCOUNT_SID)
+            except Exception:
+                logger.debug("Skipping account match check due to parse error")
+
+            # map content-type to extension
+            ext = ".bin"
+            if "ogg" in media_ct or "opus" in media_ct:
+                ext = ".ogg"
+            elif "mpeg" in media_ct or "mp3" in media_ct:
+                ext = ".mp3"
+            elif "wav" in media_ct:
+                ext = ".wav"
+
             try:
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    raw_path = os.path.join(tmpdir, "incoming_media")
+                    raw_path = os.path.join(tmpdir, f"incoming_media{ext}")
+
                     acct = TWILIO_ACCOUNT_SID.strip() if TWILIO_ACCOUNT_SID else ""
                     token = TWILIO_AUTH_TOKEN.strip() if TWILIO_AUTH_TOKEN else ""
                     auth_tuple = (acct, token) if (acct and token) else None
+
+                    logger.info("Media fetch will attempt auth=%s, account_sid_present=%s", bool(auth_tuple), bool(acct))
+
+                    # Use robust multi-strategy downloader
                     download_media(media_url, raw_path, auth=auth_tuple, timeout=30)
+
+                    # transcription attempts
                     transcription = transcribe_with_openai(raw_path)
                     if not transcription:
                         mp3_path = os.path.join(tmpdir, "converted.mp3")
                         try:
                             convert_to_mp3(raw_path, mp3_path)
                             transcription = transcribe_with_openai(mp3_path)
-                        except subprocess.CalledProcessError:
-                            logger.exception("ffmpeg conversion failed")
+                        except subprocess.CalledProcessError as cpe:
+                            logger.exception("ffmpeg conversion failed: %s", cpe)
                     user_input = transcription or "[voice message received but could not transcribe]"
+
+                    if DEBUG_SAVE_MEDIA:
+                        save_dest = os.path.join(os.getcwd(), f"debug_media_{os.path.basename(raw_path)}")
+                        with open(raw_path, "rb") as rfh, open(save_dest, "wb") as wfh:
+                            wfh.write(rfh.read())
+                        logger.info("Saved debug media to %s", save_dest)
+            except requests.HTTPError as http_err:
+                logger.exception("HTTP error processing incoming media: %s", http_err)
+                user_input = "[error processing voice message - media fetch failed]"
             except Exception as e:
                 logger.exception("Error processing incoming media: %s", e)
                 user_input = "[error processing voice message]"
@@ -490,23 +542,6 @@ def whatsapp_webhook():
             resp.message("👋 I didn’t receive any text. Please send a message.")
             return str(resp), 200
 
-        # If user was previously prompted for tone using Twilio, accept direct replies
-        lower = user_input.lower().strip()
-        if from_number in pending_tone_requests and lower in ("professional", "casual"):
-            tone_preferences[from_number] = lower
-            pending_tone_requests.discard(from_number)
-            resp = MessagingResponse()
-            resp.message(f"Got it — I'll reply in a {lower.capitalize()} tone. How can I help today?")
-            return str(resp), 200
-
-        # If message looks like a problem and we haven't asked tone yet, prompt for tone (Twilio fallback)
-        if is_problem_statement(user_input) and from_number not in tone_preferences and from_number not in pending_tone_requests:
-            pending_tone_requests.add(from_number)
-            resp = MessagingResponse()
-            resp.message("Would you like replies in a Professional or Casual tone? Reply 'Professional' or 'Casual'.")
-            return str(resp), 200
-
-        # Otherwise generate reply normally
         reply = generate_reply_for_input(from_number, user_input)
         resp = MessagingResponse()
         resp.message(reply)
@@ -552,8 +587,7 @@ def meta_webhook():
                         # text messages
                         if msg.get("type") == "text":
                             user_input = msg["text"]["body"].strip()
-                            # keep the friendly heart reaction for quick greetings but DO NOT push the tone template here
-                            if should_react_with_heart(user_input):
+                            if user_input.lower() in ("hi", "hello", "hey"):
                                 try:
                                     if message_id:
                                         send_whatsapp_reaction(
@@ -563,13 +597,16 @@ def meta_webhook():
                                         send_meta_text(from_number, "❤️")
                                 except Exception:
                                     logger.exception("Error sending reaction on greeting")
-                                # Do not send interactive tone choice on simple greeting — wait for a problem statement
+                                try:
+                                    send_meta_interactive_tone_choice(from_number)
+                                except Exception:
+                                    logger.exception("Error sending interactive tone choice")
                                 continue
 
-                        # audio/voice handling (Meta) -- unchanged
+                        # audio/voice handling (Meta)
                         elif msg.get("type") in ("audio", "voice"):
                             try:
-                                media_obj = msg.get(msg["type"], {})
+                                media_obj = msg.get(msg["type"], {})  # contains id
                                 media_id = media_obj.get("id")
                                 if media_id:
                                     media_url_fetch = f"https://graph.facebook.com/v17.0/{media_id}"
@@ -581,19 +618,21 @@ def meta_webhook():
                                     if media_link:
                                         with tempfile.TemporaryDirectory() as tmpdir:
                                             raw_path = os.path.join(tmpdir, "voice_input")
-                                            download_media(media_link, raw_path)
+                                            download_media(media_link, raw_path)  # Meta link usually doesn't need Twilio auth
                                             transcription = transcribe_with_openai(raw_path)
                                             if not transcription:
                                                 mp3_path = os.path.join(tmpdir, "voice.mp3")
                                                 try:
                                                     convert_to_mp3(raw_path, mp3_path)
                                                     transcription = transcribe_with_openai(mp3_path)
-                                                except subprocess.CalledProcessError:
-                                                    logger.exception("ffmpeg conversion failed for meta media")
+                                                except subprocess.CalledProcessError as cpe:
+                                                    logger.exception("ffmpeg conversion failed for meta media: %s", cpe)
                                             user_input = transcription or "[voice message received but could not transcribe]"
                                     else:
+                                        logger.warning("No media link returned for media id %s", media_id)
                                         user_input = "[voice message received but could not fetch media]"
                                 else:
+                                    logger.warning("No media id found in message object: %s", msg)
                                     user_input = "[voice message received but media id missing]"
                             except Exception as e:
                                 logger.exception("Error fetching/transcribing meta audio: %s", e)
@@ -624,6 +663,7 @@ def meta_webhook():
                                     continue
 
                         if not user_input:
+                            # fallback skip (locations, stickers etc.)
                             user_input = None
 
                         if user_input:
@@ -635,15 +675,6 @@ def meta_webhook():
                                         )
                             except Exception:
                                 logger.exception("Error sending reaction for user_input")
-
-                            # If this message contains a problem and we don't yet have a tone set, prompt with interactive template
-                            if is_problem_statement(user_input) and from_number not in tone_preferences:
-                                try:
-                                    send_meta_interactive_tone_choice(from_number)
-                                except Exception:
-                                    logger.exception("Error sending interactive tone choice on problem")
-                                # we prompt for tone first; the user will select via button reply
-                                continue
 
                             reply_text = generate_reply_for_input(from_number, user_input)
                             send_url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
