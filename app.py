@@ -6,6 +6,7 @@ import requests
 import traceback
 import logging
 import base64
+import re
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
@@ -137,6 +138,7 @@ Step 2. Decide on a Framework
 • If the main difficulty is managing emotions, relationships, or conflict → Apply 4Rs.
 • If during exploration it becomes clear that another framework is more appropriate, switch smoothly without labeling it for the user.
 • Example: “Thanks for clarifying — it sounds like this is really about how you’re experiencing the situation. Let’s try a different approach.”
+
 
 Step 3. Apply the Framework
 • STEP Flow:
@@ -332,18 +334,48 @@ def generate_reply_for_input(user_id: str, user_input: str) -> str:
                 messages.append({"role": "user", "content": effective_input})
                 try:
                     resp = openai_client.chat.completions.create(model="gpt-4o-mini", messages=messages)
-                    # handle response formats gracefully
+                    text = None
+
+                    # 1) dict-like responses
                     if isinstance(resp, dict):
-                        # openai package may return dict-like
                         choices = resp.get("choices") or []
                         if choices:
+                            # handle both "message" and legacy "text"
                             text = choices[0].get("message", {}).get("content") or choices[0].get("text")
-                            result = {"answer": text}
-                        else:
-                            result = {"answer": "Sorry, I'm having trouble right now."}
+                        result = {"answer": text or "Sorry, I'm having trouble right now."}
+
                     else:
-                        # fallback string
-                        result = {"answer": str(resp)}
+                        # 2) object-like responses (OpenAI SDK objects)
+                        try:
+                            # try attribute-style access (choices -> message -> content)
+                            choices = getattr(resp, "choices", None)
+                            if choices and len(choices) > 0:
+                                first = choices[0]
+                                # prefer .message.content
+                                msg = getattr(first, "message", None)
+                                if msg is not None:
+                                    text = getattr(msg, "content", None)
+                                # fallback to .text or .delta
+                                if not text:
+                                    text = getattr(first, "text", None)
+                                    if not text:
+                                        # sometimes content is nested under .message['content']-like
+                                        try:
+                                            text = first.get("message", {}).get("content")
+                                        except Exception:
+                                            text = None
+                            # final fallback: stringification may include content; attempt regex
+                            if not text:
+                                s = str(resp)
+                                m = re.search(r"message=ChatCompletionMessage\\(content='(.*?)'", s)
+                                if not m:
+                                    m = re.search(r"content='(.*?)'", s)
+                                if m:
+                                    text = m.group(1)
+                            result = {"answer": text or str(resp)}
+                        except Exception:
+                            # absolute fallback to string
+                            result = {"answer": str(resp)}
                 except Exception as e:
                     logger.exception("Error calling OpenAI chat completions: %s", e)
                     result = {"answer": "Sorry, something went wrong while processing your request."}
@@ -353,15 +385,26 @@ def generate_reply_for_input(user_id: str, user_input: str) -> str:
         logger.exception("Error invoking QA chain: %s", e)
         result = {"answer": "Sorry, something went wrong while processing your request."}
 
-    answer = (
-        result.get("answer")
-        or result.get("output_text")
-        or result.get("result")
-        or result.get("output")
-        if isinstance(result, dict)
-        else (result if isinstance(result, str) else str(result))
-    )
+    # normalize result to a single answer string
+    if isinstance(result, dict):
+        answer = (
+            result.get("answer")
+            or result.get("output_text")
+            or result.get("result")
+            or result.get("output")
+            or ""
+        )
+    else:
+        answer = result if isinstance(result, str) else str(result)
 
+    # Ensure answer is a plain string (no nested objects)
+    if not isinstance(answer, str):
+        try:
+            answer = str(answer)
+        except Exception:
+            answer = "Sorry, I couldn't format the assistant response."
+
+    # maintain conversation memory
     history = chat_history_for_chain[:] if chat_history_for_chain else []
     history += [{"role": "user", "content": user_input}, {"role": "assistant", "content": answer}]
     if len(history) > 20:
