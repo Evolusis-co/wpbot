@@ -59,15 +59,37 @@ except Exception as e:
     logger.exception("Could not initialize OpenAI v1 client: %s", e)
     openai_client = None
 
-# --- RAG pipeline setup (langchain + vectorstore) ---
+# --- RAG pipeline setup (langchain + vectorstore) + ChatPromptTemplate-based prompts ---
+ChatPromptTemplateImpl = None
+MessagesPlaceholderImpl = None
+FAISS = None
+GoogleGenerativeAIEmbeddings = None
+ChatOpenAI = None
+create_history_aware_retriever = None
+create_retrieval_chain = None
+create_stuff_documents_chain = None
+
+embeddings = None
+db = None
+db_retriever = None
+
 try:
+    # guarded imports (support both langchain_core and older/langchain locations)
+    try:
+        from langchain_core.prompts import ChatPromptTemplate as ChatPromptTemplateImpl, MessagesPlaceholder as MessagesPlaceholderImpl
+    except Exception:
+        try:
+            from langchain.prompts.chat import ChatPromptTemplate as ChatPromptTemplateImpl, MessagesPlaceholder as MessagesPlaceholderImpl
+        except Exception:
+            ChatPromptTemplateImpl = None
+            MessagesPlaceholderImpl = None
+
+    # other optional integrations (may require separate pip packages)
     from langchain_community.vectorstores import FAISS
     from langchain_google_genai import GoogleGenerativeAIEmbeddings
-    from langchain.prompts import PromptTemplate
     from langchain_openai import ChatOpenAI
     from langchain.chains import create_history_aware_retriever, create_retrieval_chain
     from langchain.chains.combine_documents import create_stuff_documents_chain
-    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     db = FAISS.load_local("my_vector_store", embeddings, allow_dangerous_deserialization=True)
@@ -199,25 +221,83 @@ ANSWER:
 </s>[INST]
 """
 
-from langchain.prompts import PromptTemplate as LCPromptTemplate
-prompt = LCPromptTemplate(template=prompt_template, input_variables=["context", "question", "chat_history"])
-
-# LLM + chains (guarded)
-try:
-    llm = ChatOpenAI(api_key=OPENAI_API_KEY, model_name="gpt-4o-mini")
+# Build ChatPromptTemplate-based prompts (fallback to simple shim if ChatPromptTemplate missing)
+if ChatPromptTemplateImpl is not None and MessagesPlaceholderImpl is not None:
     contextualize_q_system_prompt = "Given the conversation so far and a follow-up question, rephrase the follow-up question to be a standalone question."
-    contextualize_q_prompt = ChatPromptTemplate.from_messages(
-        [("system", contextualize_q_system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")]
+    contextualize_q_prompt = ChatPromptTemplateImpl.from_messages(
+        [
+            ("system", contextualize_q_system_prompt),
+            ("placeholder", "{chat_history}"),
+            ("human", "{input}"),
+        ]
     )
-    history_aware_retriever = create_history_aware_retriever(llm, db_retriever, contextualize_q_prompt)
 
-    qa_system_text = prompt_template.replace("{question}", "{input}")
-    qa_chat_prompt = ChatPromptTemplate.from_messages(
-        [("system", qa_system_text), MessagesPlaceholder("chat_history"), ("human", "{input}")]
+    qa_chat_prompt = ChatPromptTemplateImpl.from_messages(
+        [
+            ("system", prompt_template),
+            ("placeholder", "{chat_history}"),
+            ("human", "{input}"),
+        ]
     )
-    question_answer_chain = create_stuff_documents_chain(llm, qa_chat_prompt)
-    qa = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-    logger.info("LLM and retrieval chain initialized")
+else:
+    # minimal shim: simple wrapper that mimics .from_messages().invoke/format usage
+    class _ShimChatPrompt:
+        def __init__(self, messages):
+            self.messages = messages
+
+        @classmethod
+        def from_messages(cls, messages):
+            return cls(messages)
+
+        def invoke(self, mapping):
+            parts = []
+            for role, content in self.messages:
+                if role == "placeholder":
+                    varname = content.strip().strip("{}")
+                    chat_history = mapping.get(varname) or mapping.get("chat_history") or []
+                    if isinstance(chat_history, list):
+                        for m in chat_history:
+                            if isinstance(m, dict):
+                                parts.append(f"{m.get('role','user')}: {m.get('content','')}")
+                            elif isinstance(m, (list, tuple)) and len(m) == 2:
+                                parts.append(f"{m[0]}: {m[1]}")
+                    else:
+                        parts.append(str(chat_history))
+                else:
+                    try:
+                        parts.append(content.format(**mapping))
+                    except Exception:
+                        parts.append(content)
+            return {"text": "\n\n".join(parts)}
+
+    contextualize_q_prompt = _ShimChatPrompt.from_messages(
+        [("system", "Given the conversation so far and a follow-up question, rephrase the follow-up question to be a standalone question."), ("placeholder", "{chat_history}"), ("human", "{input}")]
+    )
+    qa_chat_prompt = _ShimChatPrompt.from_messages([("system", prompt_template), ("placeholder", "{chat_history}"), ("human", "{input}")])
+
+# LLM + chains (guarded, retains existing behaviour)
+try:
+    if ChatOpenAI is None:
+        try:
+            from langchain_openai import ChatOpenAI
+        except Exception:
+            ChatOpenAI = None
+
+    llm = None
+    if ChatOpenAI is not None:
+        llm = ChatOpenAI(api_key=OPENAI_API_KEY, model_name="gpt-4o-mini")
+    else:
+        llm = None
+
+    if llm and db_retriever and create_history_aware_retriever and create_retrieval_chain and create_stuff_documents_chain:
+        history_aware_retriever = create_history_aware_retriever(llm, db_retriever, contextualize_q_prompt)
+        question_answer_chain = create_stuff_documents_chain(llm, qa_chat_prompt)
+        qa = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+        logger.info("LLM and retrieval chain initialized")
+    else:
+        qa = None
+        history_aware_retriever = None
+        logger.info("LLM/chain not initialized (missing optional dependencies); falling back to non-RAG behaviour")
 except Exception as e:
     logger.exception("Error initializing LLM or chains: %s", e)
     llm = None
@@ -235,9 +315,40 @@ def generate_reply_for_input(user_id: str, user_input: str) -> str:
     chat_history_for_chain = conversation_memory.get(user_id, [])
     try:
         if qa:
+            # prefer the retrieval chain API which expects {"input": ..., "chat_history": ...}
             result = qa.invoke({"input": effective_input, "chat_history": chat_history_for_chain})
         else:
-            result = {"answer": "Sorry, the assistant is temporarily unavailable."}
+            # fallback: if no QA chain, try to use OpenAI client directly for a simple chat reply
+            if openai_client:
+                # build a simple chat-style prompt using the system prompt and history
+                messages = []
+                messages.append({"role": "system", "content": prompt_template})
+                for h in chat_history_for_chain:
+                    # accept both dict role/content and tuple forms
+                    if isinstance(h, dict) and "role" in h and "content" in h:
+                        messages.append({"role": h["role"], "content": h["content"]})
+                    elif isinstance(h, (list, tuple)) and len(h) == 2:
+                        messages.append({"role": "user", "content": h[1]})
+                messages.append({"role": "user", "content": effective_input})
+                try:
+                    resp = openai_client.chat.completions.create(model="gpt-4o-mini", messages=messages)
+                    # handle response formats gracefully
+                    if isinstance(resp, dict):
+                        # openai package may return dict-like
+                        choices = resp.get("choices") or []
+                        if choices:
+                            text = choices[0].get("message", {}).get("content") or choices[0].get("text")
+                            result = {"answer": text}
+                        else:
+                            result = {"answer": "Sorry, I'm having trouble right now."}
+                    else:
+                        # fallback string
+                        result = {"answer": str(resp)}
+                except Exception as e:
+                    logger.exception("Error calling OpenAI chat completions: %s", e)
+                    result = {"answer": "Sorry, something went wrong while processing your request."}
+            else:
+                result = {"answer": "Sorry, the assistant is temporarily unavailable."}
     except Exception as e:
         logger.exception("Error invoking QA chain: %s", e)
         result = {"answer": "Sorry, something went wrong while processing your request."}
