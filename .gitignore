@@ -3,9 +3,45 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.py[cod]
+*$py.class
 venv/
+env/
+ENV/
+
+# Environment variables (NEVER commit secrets!)
 .env
+*.env
+!.env.example
 
-# FAISS vector store
+# Vector stores (data is in Qdrant Cloud, no need to commit)
+my_vector_store/
+*.faiss
+*.pkl
 
+# Qdrant JSON files (optional - large files, data already in cloud)
+scenarios_qdrant_corrected.json
+
+# Source documents (optional - keep if you want version control)
+# Uncomment the line below if you DON'T want to commit Word docs
+# *.docx
+
+# IDE and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+
+# Data directories
 LEGAL-DATA/

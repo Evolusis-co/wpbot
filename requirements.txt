@@ -26,6 +26,8 @@ gunicorn
 twilio
 werkzeug
 tiktoken
+qdrant-client
+langchain-qdrant
 
 
 # conda create -p venv python==3.12

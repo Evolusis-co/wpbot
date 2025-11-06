@@ -131,32 +131,84 @@ try:
             create_stuff_documents_chain = None
             logger.debug("Chain helpers not available (optional)")
 
-    # Attempt to initialize embeddings + FAISS only if both pieces are present
-    if GoogleGenerativeAIEmbeddings and FAISS:
+    # Attempt to initialize embeddings + Qdrant vector store
+    if GoogleGenerativeAIEmbeddings:
         try:
+            # Import Qdrant components
+            try:
+                from qdrant_client import QdrantClient
+                from langchain_qdrant import QdrantVectorStore
+                logger.info("Imported Qdrant components")
+            except Exception as e:
+                logger.warning("Qdrant not available, falling back to FAISS if available: %s", e)
+                QdrantClient = None
+                QdrantVectorStore = None
+            
             embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-            # only attempt to load vector store if path exists to avoid noisy exceptions
-            vs_path = "my_vector_store"
-            if os.path.isdir(vs_path):
-                try:
-                    db = FAISS.load_local(vs_path, embeddings, allow_dangerous_deserialization=True)
-                    db_retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 4})
-                    logger.info("Vector store loaded from %s", vs_path)
-                except Exception as e:
-                    logger.exception("Failed to load local vector store at %s: %s", vs_path, e)
+            
+            # Try Qdrant first (prioritize cloud vector store)
+            if QdrantClient and QdrantVectorStore:
+                qdrant_url = os.getenv("QDRANT_URL")
+                qdrant_api_key = os.getenv("QDRANT_API_KEY")
+                
+                if qdrant_url:
+                    try:
+                        # Connect to Qdrant Cloud
+                        qdrant_client = QdrantClient(
+                            url=qdrant_url,
+                            api_key=qdrant_api_key
+                        )
+                        
+                        # Initialize Qdrant vectorstore
+                        db = QdrantVectorStore(
+                            client=qdrant_client,
+                            collection_name="bridgetext_scenarios",
+                            embedding=embeddings
+                        )
+                        
+                        db_retriever = db.as_retriever(
+                            search_type="similarity",
+                            search_kwargs={"k": 3}  # Retrieve top 3 relevant scenarios
+                        )
+                        
+                        logger.info("✅ Qdrant vector store loaded successfully from %s", qdrant_url)
+                    except Exception as e:
+                        logger.exception("Failed to connect to Qdrant: %s", e)
+                        db = None
+                        db_retriever = None
+                else:
+                    logger.info("QDRANT_URL not set, skipping Qdrant initialization")
+                    db = None
+                    db_retriever = None
+            
+            # Fallback to FAISS if Qdrant not available
+            elif FAISS:
+                vs_path = "my_vector_store"
+                if os.path.isdir(vs_path):
+                    try:
+                        db = FAISS.load_local(vs_path, embeddings, allow_dangerous_deserialization=True)
+                        db_retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+                        logger.info("Vector store loaded from local FAISS: %s", vs_path)
+                    except Exception as e:
+                        logger.exception("Failed to load local vector store at %s: %s", vs_path, e)
+                        db = None
+                        db_retriever = None
+                else:
+                    logger.info("Vector store path %s not found; skipping load", vs_path)
                     db = None
                     db_retriever = None
             else:
-                logger.info("Vector store path %s not found; skipping load", vs_path)
+                logger.info("No vector store available (neither Qdrant nor FAISS)")
                 db = None
                 db_retriever = None
+                
         except Exception as e:
             logger.exception("Error initializing embeddings or vector store: %s", e)
             embeddings = None
             db = None
             db_retriever = None
     else:
-        logger.info("Skipping embeddings/FAISS initialization (missing optional dependencies)")
+        logger.info("Skipping embeddings initialization (missing GoogleGenerativeAIEmbeddings)")
 
 except Exception as e:
     # Catch-all safeguard: never let optional langchain failures crash the app
@@ -828,25 +880,29 @@ def meta_webhook():
                         from_number = msg.get("from") or "anonymous"
                         message_id = msg.get("id")
                         user_input = None
+                        
+                        # Debug logging for iOS/Android differences
+                        logger.debug(f"Incoming message type: {msg.get('type')}, from: {from_number}, msg_id: {message_id}")
 
                         # text messages
                         if msg.get("type") == "text":
                             user_input = msg["text"]["body"].strip()
-                            if user_input.lower() in ("hi", "hello", "hey"):
+                            logger.debug(f"Text message received: '{user_input}' (length: {len(user_input)})")
+                            # Normalize greetings for consistent handling across iOS/Android
+                            if user_input.lower().strip() in ("hi", "hello", "hey", "hi!", "hello!", "hey!"):
                                 try:
                                     if message_id:
                                         send_whatsapp_reaction(
                                             from_number, message_id, "❤️", META_PHONE_NUMBER_ID, META_ACCESS_TOKEN
                                         )
-                                    else:
-                                        send_meta_text(from_number, "❤️")
                                 except Exception:
                                     logger.exception("Error sending reaction on greeting")
                                 try:
                                     send_meta_interactive_tone_choice(from_number)
                                 except Exception:
                                     logger.exception("Error sending interactive tone choice")
-                                continue
+                                # Don't skip - let the AI respond too for consistent experience
+                                # continue  # Removed to ensure greeting response on all platforms
 
                         # audio/voice handling (Meta)
                         elif msg.get("type") in ("audio", "voice"):
