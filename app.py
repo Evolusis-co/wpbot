@@ -901,8 +901,8 @@ def meta_webhook():
                                     send_meta_interactive_tone_choice(from_number)
                                 except Exception:
                                     logger.exception("Error sending interactive tone choice")
-                                # Don't skip - let the AI respond too for consistent experience
-                                # continue  # Removed to ensure greeting response on all platforms
+                                # Skip AI response - buttons are enough for greeting
+                                continue
 
                         # audio/voice handling (Meta)
                         elif msg.get("type") in ("audio", "voice"):
