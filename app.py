@@ -383,6 +383,10 @@ ANSWER:
 </s>[INST]
 """
 
+# Prompt/runtime flags for quick verification in logs and /health
+PROMPT_MODE = "casual_default_with_auto_professional_templates"
+WORKPLACE_ONLY = True
+
 # Build ChatPromptTemplate-based prompts (fallback to simple shim if ChatPromptTemplate missing)
 if ChatPromptTemplateImpl is not None and MessagesPlaceholderImpl is not None:
     contextualize_q_system_prompt = "Given the conversation so far and a follow-up question, rephrase the follow-up question to be a standalone question."
@@ -803,9 +807,12 @@ except Exception:
     validator = None
     logger.debug("Twilio RequestValidator not available or failed to initialize")
 
+# Log current prompt configuration so we can verify on Render
+logger.info("Prompt mode: %s | Workplace-only: %s", PROMPT_MODE, WORKPLACE_ONLY)
+
 @app.route("/health", methods=["GET"])
 def health():
-    return {"ok": True}, 200
+    return {"ok": True, "prompt_mode": PROMPT_MODE, "workplace_only": WORKPLACE_ONLY}, 200
 
 # --- Twilio Webhook ---
 @app.route("/whatsapp-webhook", methods=["POST"])
