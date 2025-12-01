@@ -860,7 +860,7 @@ except Exception:
     logger.debug("Twilio RequestValidator not available or failed to initialize")
 
 # Log current prompt configuration so we can verify on Render
-logger.info("Prompt mode: %s | Workplace-only: %s", PROMPT_MODE, WORKPLACE_ONLY)
+logger.info("Prompt mode: %s | Workplace-only: %s | One-time unauthorized notification: enabled", PROMPT_MODE, WORKPLACE_ONLY)
 
 @app.route("/health", methods=["GET"])
 def health():
