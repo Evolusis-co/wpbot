@@ -761,6 +761,26 @@ def should_react_with_heart(user_input: str) -> bool:
     # Check if it's ONLY a greeting (not "hi, I need help with...")
     return normalized in greetings or (len(normalized) <= 6 and normalized.startswith(("hi", "hey")))
 
+def is_non_workplace_topic(text: str) -> bool:
+    """Detect topics we should not entertain (gossip/personal/non-work)."""
+    t = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+    block_terms = [
+        "gossip", "rumor", "rumour", "tea", "spill the tea", "celebrity", "celeb",
+        "dating", "crush", "relationship", "love life", "boyfriend", "girlfriend",
+        "politics", "election", "religion", "astrology",
+        "movie", "series", "cricket", "football", "match score", "bollywood", "hollywood",
+    ]
+    for term in block_terms:
+        if term in t:
+            return True
+    return False
+
+def workplace_boundary_message() -> str:
+    return (
+        "Let’s keep this strictly work‑related. If it’s impacting work (stress, team friction, focus),"
+        " tell me how — otherwise I can’t discuss gossip or non‑work topics."
+    )
+
 def send_meta_text(to_number: str, text: str):
     url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
     payload = {"messaging_product": "whatsapp", "to": to_number, "text": {"body": text}}
@@ -972,6 +992,14 @@ def meta_webhook():
                                 except Exception:
                                     logger.exception("Error sending reaction on greeting")
                                 # Let AI respond naturally in casual tone (no tone selection buttons)
+                            else:
+                                # Enforce workplace-only topics before generating reply
+                                if is_non_workplace_topic(user_input):
+                                    try:
+                                        send_meta_text(from_number, workplace_boundary_message())
+                                    except Exception:
+                                        logger.exception("Error sending boundary message")
+                                    continue
 
                         # audio/voice handling (Meta)
                         elif msg.get("type") in ("audio", "voice"):
