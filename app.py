@@ -793,7 +793,7 @@ def is_sensitive_workplace_issue(text: str) -> bool:
 
 def sensitive_guidance_message() -> str:
     return (
-        "I’m switching to a more formal guide since this involves workplace safety and conduct.\n\n"
+        "This involves workplace conduct and safety. Here’s a concise professional guide you can use right now:\n\n"
         "1) Safety first: If you ever feel unsafe, step away and contact a trusted senior/HR immediately.\n"
         "2) Document facts: date/time, what was said/done, location, witnesses, any messages.\n"
         "3) Boundary script (DM or in person): ‘I want to be clear — that made me uncomfortable. \n"
@@ -803,7 +803,7 @@ def sensitive_guidance_message() -> str:
         "On [date/time] at [place], [name/role] [brief factual description].\n"
         "This affects my ability to work comfortably. I’m requesting guidance on next steps.\n"
         "I’ve attached any relevant evidence.\nThanks,\n[Your Name]\n\n"
-        "If you want, I can help refine the boundary message or the email draft." 
+        "If you want, I can help refine the boundary message or the email draft."
     )
 
 def send_meta_text(to_number: str, text: str):
