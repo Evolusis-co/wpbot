@@ -11,6 +11,7 @@ ENV/
 
 # Environment variables (NEVER commit secrets!)
 .env
+.env.render
 *.env
 !.env.example
 

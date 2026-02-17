@@ -17,7 +17,6 @@ from dotenv import load_dotenv
 # --- Load environment ---
 load_dotenv()
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 # Accept multiple env names and sanitize (strip quotes/spaces)
@@ -89,183 +88,21 @@ def is_user_authorized(phone_number):
 load_allowed_users()
 
 # --- OpenAI client (v1+) ---
+OPENAI_MODEL = "gpt-4o-mini"
 openai_client = None
 try:
     from openai import OpenAI
 
     if OPENAI_API_KEY:
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        logger.info("OpenAI client initialized")
     else:
-        openai_client = OpenAI()
-    logger.info("OpenAI client initialized")
+        logger.warning("OPENAI_API_KEY is missing; assistant replies will use fallback messages")
 except Exception as e:
     logger.exception("Could not initialize OpenAI v1 client: %s", e)
     openai_client = None
 
-# --- RAG pipeline setup (langchain + vectorstore) + ChatPromptTemplate-based prompts ---
-ChatPromptTemplateImpl = None
-MessagesPlaceholderImpl = None
-FAISS = None
-GoogleGenerativeAIEmbeddings = None
-ChatOpenAI = None
-create_history_aware_retriever = None
-create_retrieval_chain = None
-create_stuff_documents_chain = None
-
-embeddings = None
-db = None
-db_retriever = None
-
-# Guarded, granular imports so missing packages won't crash the app at startup
-try:
-    # Chat prompt template (try multiple possible import paths)
-    try:
-        from langchain_core.prompts import ChatPromptTemplate as ChatPromptTemplateImpl, MessagesPlaceholder as MessagesPlaceholderImpl
-        logger.info("Imported ChatPromptTemplate from langchain_core.prompts")
-    except Exception:
-        try:
-            from langchain.prompts.chat import ChatPromptTemplate as ChatPromptTemplateImpl, MessagesPlaceholder as MessagesPlaceholderImpl
-            logger.info("Imported ChatPromptTemplate from langchain.prompts.chat")
-        except Exception:
-            ChatPromptTemplateImpl = None
-            MessagesPlaceholderImpl = None
-            logger.debug("ChatPromptTemplate not available (optional)")
-
-    # vectorstore and embeddings (optional)
-    try:
-        from langchain_community.vectorstores import FAISS
-        logger.info("Imported FAISS vectorstore")
-    except Exception:
-        FAISS = None
-        logger.debug("FAISS not available (optional)")
-
-    try:
-        from langchain_google_genai import GoogleGenerativeAIEmbeddings
-        logger.info("Imported GoogleGenerativeAIEmbeddings")
-    except Exception:
-        GoogleGenerativeAIEmbeddings = None
-        logger.debug("GoogleGenerativeAIEmbeddings not available (optional)")
-
-    # langchain Chat LLM wrapper (optional)
-    try:
-        from langchain_openai import ChatOpenAI
-        ChatOpenAI = ChatOpenAI
-        logger.info("Imported langchain_openai.ChatOpenAI")
-    except Exception:
-        ChatOpenAI = None
-        logger.debug("langchain_openai.ChatOpenAI not available (optional)")
-
-    # chains helpers (optional) - try multiple paths and fallback to None
-    try:
-        # newer langchain organization may expose these in different modules
-        from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-        from langchain.chains.combine_documents import create_stuff_documents_chain
-        logger.info("Imported chain helpers from langchain.chains")
-    except Exception:
-        try:
-            # fallback to older or alternate locations
-            from langchain_community.chains import create_history_aware_retriever, create_retrieval_chain
-            from langchain.chains.combine_documents import create_stuff_documents_chain
-            logger.info("Imported chain helpers from fallback locations")
-        except Exception:
-            create_history_aware_retriever = None
-            create_retrieval_chain = None
-            create_stuff_documents_chain = None
-            logger.debug("Chain helpers not available (optional)")
-
-    # Attempt to initialize embeddings + Qdrant vector store
-    if GoogleGenerativeAIEmbeddings:
-        try:
-            # Import Qdrant components
-            try:
-                from qdrant_client import QdrantClient
-                from langchain_qdrant import QdrantVectorStore
-                logger.info("Imported Qdrant components")
-            except Exception as e:
-                logger.warning("Qdrant not available, falling back to FAISS if available: %s", e)
-                QdrantClient = None
-                QdrantVectorStore = None
-            
-            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-            
-            # Try Qdrant first (prioritize cloud vector store)
-            if QdrantClient and QdrantVectorStore:
-                qdrant_url = os.getenv("QDRANT_URL")
-                qdrant_api_key = os.getenv("QDRANT_API_KEY")
-                
-                if qdrant_url:
-                    try:
-                        # Connect to Qdrant Cloud
-                        qdrant_client = QdrantClient(
-                            url=qdrant_url,
-                            api_key=qdrant_api_key
-                        )
-                        
-                        # Initialize Qdrant vectorstore
-                        db = QdrantVectorStore(
-                            client=qdrant_client,
-                            collection_name="bridgetext_scenarios",
-                            embedding=embeddings
-                        )
-                        
-                        db_retriever = db.as_retriever(
-                            search_type="similarity",
-                            search_kwargs={"k": 3}  # Retrieve top 3 relevant scenarios
-                        )
-                        
-                        logger.info("✅ Qdrant vector store loaded successfully from %s", qdrant_url)
-                    except Exception as e:
-                        logger.exception("Failed to connect to Qdrant: %s", e)
-                        db = None
-                        db_retriever = None
-                else:
-                    logger.info("QDRANT_URL not set, skipping Qdrant initialization")
-                    db = None
-                    db_retriever = None
-            
-            # Fallback to FAISS if Qdrant not available
-            elif FAISS:
-                vs_path = "my_vector_store"
-                if os.path.isdir(vs_path):
-                    try:
-                        db = FAISS.load_local(vs_path, embeddings, allow_dangerous_deserialization=True)
-                        db_retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 4})
-                        logger.info("Vector store loaded from local FAISS: %s", vs_path)
-                    except Exception as e:
-                        logger.exception("Failed to load local vector store at %s: %s", vs_path, e)
-                        db = None
-                        db_retriever = None
-                else:
-                    logger.info("Vector store path %s not found; skipping load", vs_path)
-                    db = None
-                    db_retriever = None
-            else:
-                logger.info("No vector store available (neither Qdrant nor FAISS)")
-                db = None
-                db_retriever = None
-                
-        except Exception as e:
-            logger.exception("Error initializing embeddings or vector store: %s", e)
-            embeddings = None
-            db = None
-            db_retriever = None
-    else:
-        logger.info("Skipping embeddings initialization (missing GoogleGenerativeAIEmbeddings)")
-
-except Exception as e:
-    # Catch-all safeguard: never let optional langchain failures crash the app
-    logger.exception("Error initializing vector store or langchain modules: %s", e)
-    ChatPromptTemplateImpl = None
-    MessagesPlaceholderImpl = None
-    FAISS = None
-    GoogleGenerativeAIEmbeddings = None
-    ChatOpenAI = None
-    create_history_aware_retriever = None
-    create_retrieval_chain = None
-    create_stuff_documents_chain = None
-    embeddings = None
-    db = None
-    db_retriever = None
+# RAG/embeddings/Qdrant intentionally removed for production stability.
 
 # Prompt template (keep full prompt text as needed)
 prompt_template = """
@@ -626,211 +463,44 @@ ANSWER:
 PROMPT_MODE = "casual_default_with_auto_professional_templates"
 WORKPLACE_ONLY = True
 
-# Build ChatPromptTemplate-based prompts (fallback to simple shim if ChatPromptTemplate missing)
-if ChatPromptTemplateImpl is not None and MessagesPlaceholderImpl is not None:
-    contextualize_q_system_prompt = "Given the conversation so far and a follow-up question, rephrase the follow-up question to be a standalone question."
-    contextualize_q_prompt = ChatPromptTemplateImpl.from_messages(
-        [
-            ("system", contextualize_q_system_prompt),
-            ("placeholder", "{chat_history}"),
-            ("human", "{input}"),
-        ]
-    )
-
-    qa_chat_prompt = ChatPromptTemplateImpl.from_messages(
-        [
-            ("system", prompt_template),
-            ("placeholder", "{chat_history}"),
-            ("human", "{input}"),
-        ]
-    )
-else:
-    # minimal shim: simple wrapper that mimics .from_messages().invoke/format usage
-    class _ShimChatPrompt:
-        def __init__(self, messages):
-            self.messages = messages
-
-        @classmethod
-        def from_messages(cls, messages):
-            return cls(messages)
-
-        def invoke(self, mapping):
-            parts = []
-            for role, content in self.messages:
-                if role == "placeholder":
-                    varname = content.strip().strip("{}")
-                    chat_history = mapping.get(varname) or mapping.get("chat_history") or []
-                    if isinstance(chat_history, list):
-                        for m in chat_history:
-                            if isinstance(m, dict):
-                                parts.append(f"{m.get('role','user')}: {m.get('content','')}")
-                            elif isinstance(m, (list, tuple)) and len(m) == 2:
-                                parts.append(f"{m[0]}: {m[1]}")
-                    else:
-                        parts.append(str(chat_history))
-                else:
-                    try:
-                        parts.append(content.format(**mapping))
-                    except Exception:
-                        parts.append(content)
-            return {"text": "\n\n".join(parts)}
-
-    contextualize_q_prompt = _ShimChatPrompt.from_messages(
-        [("system", "Given the conversation so far and a follow-up question, rephrase the follow-up question to be a standalone question."), ("placeholder", "{chat_history}"), ("human", "{input}")]
-    )
-    qa_chat_prompt = _ShimChatPrompt.from_messages([("system", prompt_template), ("placeholder", "{chat_history}"), ("human", "{input}")])
-
-# LLM + chains (guarded, retains existing behaviour)
-try:
-    if ChatOpenAI is None:
-        try:
-            from langchain_openai import ChatOpenAI
-            ChatOpenAI = ChatOpenAI
-        except Exception:
-            ChatOpenAI = None
-
-    llm = None
-    if ChatOpenAI is not None:
-        try:
-            # Create a lightweight wrapper instance if possible
-            llm = ChatOpenAI(api_key=OPENAI_API_KEY, model_name="gpt-4o-mini")
-            logger.info("Langchain ChatOpenAI initialized")
-        except Exception as e:
-            logger.exception("Failed to initialize ChatOpenAI: %s", e)
-            llm = None
-    else:
-        llm = None
-
-    if llm and db_retriever and create_history_aware_retriever and create_retrieval_chain and create_stuff_documents_chain:
-        try:
-            history_aware_retriever = create_history_aware_retriever(llm, db_retriever, contextualize_q_prompt)
-            question_answer_chain = create_stuff_documents_chain(llm, qa_chat_prompt)
-            qa = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-            logger.info("LLM and retrieval chain initialized")
-        except Exception as e:
-            logger.exception("Failed to wire up retrieval chain: %s", e)
-            qa = None
-            history_aware_retriever = None
-    else:
-        qa = None
-        history_aware_retriever = None
-        logger.info("LLM/chain not initialized (missing optional dependencies); falling back to non-RAG behaviour")
-except Exception as e:
-    logger.exception("Error initializing LLM or chains: %s", e)
-    llm = None
-    qa = None
-
-# --- Detailed RAG dependency logging ---
-if not llm:
-    logger.warning("RAG not enabled: llm (ChatOpenAI) is missing or failed to initialize.")
-if not db_retriever:
-    logger.warning("RAG not enabled: db_retriever (Qdrant retriever) is missing or failed to initialize.")
-if not create_history_aware_retriever:
-    logger.warning("RAG not enabled: create_history_aware_retriever is missing.")
-if not create_retrieval_chain:
-    logger.warning("RAG not enabled: create_retrieval_chain is missing.")
-if not create_stuff_documents_chain:
-    logger.warning("RAG not enabled: create_stuff_documents_chain is missing.")
-
 # Conversation memory and tone preferences
 conversation_memory = {}
 tone_preferences = {}  # maps user_id -> "professional" | "casual"
 
 def generate_reply_for_input(user_id: str, user_input: str) -> str:
-    # No tone preference needed - AI automatically uses casual tone by default
-    effective_input = user_input
-    chat_history_for_chain = conversation_memory.get(user_id, [])
-    try:
-        if qa:
-            # prefer the retrieval chain API which expects {"input": ..., "chat_history": ...}
-            result = qa.invoke({"input": effective_input, "chat_history": chat_history_for_chain})
-        else:
-            # fallback: if no QA chain, try to use OpenAI client directly for a simple chat reply
-            if openai_client:
-                # build a simple chat-style prompt using the system prompt and history
-                messages = []
-                messages.append({"role": "system", "content": prompt_template})
-                for h in chat_history_for_chain:
-                    # accept both dict role/content and tuple forms
-                    if isinstance(h, dict) and "role" in h and "content" in h:
-                        messages.append({"role": h["role"], "content": h["content"]})
-                    elif isinstance(h, (list, tuple)) and len(h) == 2:
-                        messages.append({"role": "user", "content": h[1]})
-                messages.append({"role": "user", "content": effective_input})
-                try:
-                    resp = openai_client.chat.completions.create(model="gpt-4o-mini", messages=messages)
-                    text = None
+    fallback_error = "Sorry, something went wrong while processing your request."
+    fallback_unavailable = "Sorry, the assistant is temporarily unavailable right now."
+    chat_history = conversation_memory.get(user_id, [])
 
-                    # 1) dict-like responses
-                    if isinstance(resp, dict):
-                        choices = resp.get("choices") or []
-                        if choices:
-                            # handle both "message" and legacy "text"
-                            text = choices[0].get("message", {}).get("content") or choices[0].get("text")
-                        result = {"answer": text or "Sorry, I'm having trouble right now."}
-
-                    else:
-                        # 2) object-like responses (OpenAI SDK objects)
-                        try:
-                            # try attribute-style access (choices -> message -> content)
-                            choices = getattr(resp, "choices", None)
-                            if choices and len(choices) > 0:
-                                first = choices[0]
-                                # prefer .message.content
-                                msg = getattr(first, "message", None)
-                                if msg is not None:
-                                    text = getattr(msg, "content", None)
-                                # fallback to .text or .delta
-                                if not text:
-                                    text = getattr(first, "text", None)
-                                    if not text:
-                                        # sometimes content is nested under .message['content']-like
-                                        try:
-                                            text = first.get("message", {}).get("content")
-                                        except Exception:
-                                            text = None
-                            # final fallback: stringification may include content; attempt regex
-                            if not text:
-                                s = str(resp)
-                                m = re.search(r"message=ChatCompletionMessage\\(content='(.*?)'", s)
-                                if not m:
-                                    m = re.search(r"content='(.*?)'", s)
-                                if m:
-                                    text = m.group(1)
-                            result = {"answer": text or str(resp)}
-                        except Exception:
-                            # absolute fallback to string
-                            result = {"answer": str(resp)}
-                except Exception as e:
-                    logger.exception("Error calling OpenAI chat completions: %s", e)
-                    result = {"answer": "Sorry, something went wrong while processing your request."}
-            else:
-                result = {"answer": "Sorry, the assistant is temporarily unavailable."}
-    except Exception as e:
-        logger.exception("Error invoking QA chain: %s", e)
-        result = {"answer": "Sorry, something went wrong while processing your request."}
-
-    # normalize result to a single answer string
-    if isinstance(result, dict):
-        answer = (
-            result.get("answer")
-            or result.get("output_text")
-            or result.get("result")
-            or result.get("output")
-            or ""
-        )
+    if not openai_client:
+        logger.warning("OpenAI client unavailable; returning fallback response")
+        answer = fallback_unavailable
     else:
-        answer = result if isinstance(result, str) else str(result)
+        messages = [{"role": "system", "content": prompt_template}]
+        for item in chat_history[-18:]:
+            if isinstance(item, dict):
+                role = item.get("role")
+                content = item.get("content")
+                if role in ("system", "user", "assistant") and content:
+                    messages.append({"role": role, "content": str(content)})
 
-    # Ensure answer is a plain string (no nested objects)
-    if not isinstance(answer, str):
+        messages.append({"role": "user", "content": user_input})
+
         try:
-            answer = str(answer)
-        except Exception:
-            answer = "Sorry, I couldn't format the assistant response."
+            resp = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+            )
+            answer = (resp.choices[0].message.content or "").strip()
+            if not answer:
+                logger.warning("OpenAI returned empty content; using fallback error response")
+                answer = fallback_error
+        except Exception as e:
+            logger.exception("OpenAI chat completion failed: %s", e)
+            answer = fallback_error
 
     # maintain conversation memory
-    history = chat_history_for_chain[:] if chat_history_for_chain else []
+    history = chat_history[:] if chat_history else []
     history += [{"role": "user", "content": user_input}, {"role": "assistant", "content": answer}]
     if len(history) > 20:
         history = history[-20:]
@@ -1251,14 +921,16 @@ def meta_webhook():
                                 (normalized_input.startswith("hey") and len(normalized_input) <= 7 and all(c in "hey!" for c in normalized_input))
                             )
                             if is_greeting:
-                                logger.info(f"Greeting detected: '{user_input}' -> sending ❤️ reaction")
-                                try:
-                                    if message_id:
-                                        send_whatsapp_reaction(
-                                            from_number, message_id, "❤️", META_PHONE_NUMBER_ID, META_ACCESS_TOKEN
-                                        )
-                                except Exception:
-                                    logger.exception("Error sending reaction on greeting")
+                                logger.info(f"Greeting detected: '{user_input}' (reaction disabled)")
+                                # Heart reaction disabled to avoid 401 errors
+                                # To re-enable: update META_ACCESS_TOKEN in Render and uncomment below
+                                # try:
+                                #     if message_id:
+                                #         send_whatsapp_reaction(
+                                #             from_number, message_id, "❤️", META_PHONE_NUMBER_ID, META_ACCESS_TOKEN
+                                #         )
+                                # except Exception:
+                                #     logger.exception("Error sending reaction on greeting")
                                 # Let AI respond naturally in casual tone (no tone selection buttons)
                             else:
                                 # Enforce workplace-only topics before generating reply
