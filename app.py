@@ -1,16 +1,12 @@
-# app.py (full updated: robust Twilio/Meta media handling, auth sanitization, detailed logging)
+# app.py (Meta WhatsApp webhook + OpenAI response pipeline)
 import os
 import tempfile
 import subprocess
 import requests
 import traceback
 import logging
-import base64
 import re
-from urllib.parse import urlparse
 from flask import Flask, request, jsonify
-from twilio.twiml.messaging_response import MessagingResponse
-from twilio.request_validator import RequestValidator
 from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
 
@@ -19,15 +15,6 @@ load_dotenv()
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-# Accept multiple env names and sanitize (strip quotes/spaces)
-TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or os.getenv("TWILIO_SID") or "").strip()
-TWILIO_AUTH_TOKEN = (os.getenv("TWILIO_AUTH_TOKEN") or os.getenv("TWILIO_AUTH") or os.getenv("TWILIO_AUTH_TOKEN".upper()) or "").strip()
-
-# Backwards-compat aliases
-TWILIO_SID = TWILIO_ACCOUNT_SID
-TWILIO_AUTH = TWILIO_AUTH_TOKEN
-
-TWILIO_VALIDATE = os.getenv("TWILIO_VALIDATE", "true").lower() == "true"
 DEBUG_SAVE_MEDIA = os.getenv("DEBUG_SAVE_MEDIA", "false").lower() == "true"
 
 # Meta WhatsApp cloud env
@@ -39,11 +26,6 @@ META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "").strip()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger("whatsapp-bot")
-
-# quick runtime debug about Twilio env presence (does not log secrets)
-logger.info("TWILIO_ACCOUNT_SID present: %s", bool(TWILIO_ACCOUNT_SID))
-logger.info("TWILIO_AUTH_TOKEN present: %s", bool(TWILIO_AUTH_TOKEN))
-logger.info("TWILIO_AUTH_TOKEN length: %s", len(TWILIO_AUTH_TOKEN or ""))
 
 # --- Phone Number Authorization ---
 ALLOWED_USERS_FILE = "allowed_users.txt"
@@ -509,112 +491,24 @@ def generate_reply_for_input(user_id: str, user_input: str) -> str:
 
 # --- Robust helpers for audio download, conversion, transcription ---
 
-def _basic_auth_header(auth: tuple):
-    if not auth:
-        return {}
-    user, passwd = auth
-    token = base64.b64encode(f"{user}:{passwd}".encode()).decode()
-    return {"Authorization": f"Basic {token}"}
-
-def download_media(url: str, dest_path: str, auth: tuple = None, timeout: int = 30):
+def download_media(url: str, dest_path: str, timeout: int = 30):
     """
-    Multi-strategy media downloader:
-     - try unauthenticated GET (some providers return public link)
-     - try GET with Authorization header preserved across redirects
-     - manual redirect-follow with requests.get(..., auth=auth) on each hop
-     - try Twilio /Content endpoint fallback
+    Download media from URL and save to disk.
     Raises requests.HTTPError on failure.
     """
-    logger.debug("download_media called for %s (auth=%s)", url, bool(auth))
+    logger.debug("download_media called for %s", url)
 
-    # Strategy 1: simple unauthenticated GET (useful for Meta or public CDN links)
     try:
-        r = requests.get(url, stream=True, timeout=10, allow_redirects=True)
-        logger.debug("Unauthenticated fetch status=%s headers=%s", r.status_code, dict(list(r.headers.items())[:5]))
-        if 200 <= r.status_code < 300 and (r.headers.get("content-length") or r.content):
-            with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(10240):
-                    if chunk:
-                        f.write(chunk)
-            logger.debug("Saved media via unauthenticated fetch (%d bytes)", os.path.getsize(dest_path))
-            return
+        r = requests.get(url, stream=True, timeout=timeout, allow_redirects=True)
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(10240):
+                if chunk:
+                    f.write(chunk)
+        logger.debug("Saved media (%d bytes)", os.path.getsize(dest_path))
+        return
     except Exception as e:
-        logger.debug("Unauthenticated fetch failed: %s", e)
-
-    # Strategy 2: GET with Basic Authorization header attached (some CDNs accept header)
-    if auth:
-        headers = _basic_auth_header(auth)
-        try:
-            r = requests.get(url, headers=headers, stream=True, timeout=15, allow_redirects=True)
-            logger.debug("Auth-header fetch status=%s headers=%s", r.status_code, dict(list(r.headers.items())[:5]))
-            if 200 <= r.status_code < 300 and (r.headers.get("content-length") or r.content):
-                with open(dest_path, "wb") as f:
-                    for chunk in r.iter_content(10240):
-                        if chunk:
-                            f.write(chunk)
-                logger.debug("Saved media via auth-header fetch (%d bytes)", os.path.getsize(dest_path))
-                return
-            else:
-                logger.warning("Auth-header fetch returned non-2xx: %s. body-snippet=%s", r.status_code, (r.content[:256] if r.content else b""))
-        except Exception as e:
-            logger.debug("Auth-header fetch failed: %s", e)
-
-    # Strategy 3: manual redirect-follow with auth on each hop (preserve HTTP Basic auth)
-    if auth:
-        try:
-            current = url
-            hops = 0
-            max_hops = 8
-            while hops < max_hops:
-                logger.debug("Manual-auth hop %s -> %s", hops, current)
-                r = requests.get(current, auth=auth, stream=True, timeout=15, allow_redirects=False)
-                logger.debug("  status=%s headers=%s", r.status_code, dict(list(r.headers.items())[:5]))
-                if 200 <= r.status_code < 300:
-                    with open(dest_path, "wb") as f:
-                        for chunk in r.iter_content(10240):
-                            if chunk:
-                                f.write(chunk)
-                    logger.debug("Saved media via manual-auth fetch (%d bytes)", os.path.getsize(dest_path))
-                    return
-                if r.is_redirect or r.is_permanent_redirect:
-                    loc = r.headers.get("Location") or r.headers.get("location")
-                    if not loc:
-                        r.raise_for_status()
-                    parsed = urlparse(loc)
-                    if not parsed.scheme:
-                        current = requests.compat.urljoin(current, loc)
-                    else:
-                        current = loc
-                    hops += 1
-                    continue
-                logger.warning("Manual-auth fetch non-2xx and not redirect: status=%s body-snippet=%s", r.status_code, (r.content[:256] if r.content else b""))
-                r.raise_for_status()
-        except Exception as e:
-            logger.exception("Manual-auth fetch failed: %s", e)
-
-    # Strategy 4: Twilio media Content endpoint fallback (append /Content)
-    try:
-        parsed = urlparse(url)
-        if "api.twilio.com" in parsed.netloc and auth:
-            alt = url
-            if not parsed.path.endswith("/Content"):
-                alt = f"{url}/Content"
-            logger.debug("Trying Twilio Content endpoint: %s", alt)
-            r = requests.get(alt, auth=auth, stream=True, timeout=15, allow_redirects=True)
-            logger.debug("Twilio Content fetch status=%s headers=%s", r.status_code, dict(list(r.headers.items())[:5]))
-            if 200 <= r.status_code < 300 and (r.headers.get("content-length") or r.content):
-                with open(dest_path, "wb") as f:
-                    for chunk in r.iter_content(10240):
-                        if chunk:
-                            f.write(chunk)
-                logger.debug("Saved media via Twilio Content endpoint (%d bytes)", os.path.getsize(dest_path))
-                return
-            else:
-                logger.warning("Twilio Content fetch failed status=%s body-snippet=%s", r.status_code, (r.content[:256] if r.content else b""))
-    except Exception as e:
-        logger.debug("Twilio Content endpoint attempt failed: %s", e)
-
-    # All strategies exhausted -> raise
+        logger.exception("Media download failed: %s", e)
     raise requests.HTTPError(f"All media fetch strategies failed for {url}")
 
 def convert_to_mp3(input_path: str, output_path: str) -> None:
@@ -753,12 +647,6 @@ def send_meta_interactive_tone_choice(to_number: str):
 # --- Flask app ---
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
-validator = None
-try:
-    validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
-except Exception:
-    validator = None
-    logger.debug("Twilio RequestValidator not available or failed to initialize")
 
 # Log current prompt configuration so we can verify on Render
 logger.info("Prompt mode: %s | Workplace-only: %s | One-time unauthorized notification: enabled", PROMPT_MODE, WORKPLACE_ONLY)
@@ -766,102 +654,6 @@ logger.info("Prompt mode: %s | Workplace-only: %s | One-time unauthorized notifi
 @app.route("/health", methods=["GET"])
 def health():
     return {"ok": True, "prompt_mode": PROMPT_MODE, "workplace_only": WORKPLACE_ONLY}, 200
-
-# --- Twilio Webhook ---
-@app.route("/whatsapp-webhook", methods=["POST"])
-def whatsapp_webhook():
-    try:
-        if validator and TWILIO_VALIDATE:
-            signature = request.headers.get("X-Twilio-Signature", "")
-            try:
-                if not validator.validate(request.url, request.form, signature):
-                    logger.warning("Invalid Twilio signature")
-                    return ("Invalid signature", 403)
-            except Exception:
-                logger.exception("Twilio signature validation failed; continuing (validator threw)")
-
-        from_number = request.form.get("From", "anonymous")
-        incoming_msg = (request.form.get("Body") or "").strip()
-        num_media = int(request.form.get("NumMedia", "0"))
-
-        user_input = None
-        if num_media > 0:
-            media_url = request.form.get("MediaUrl0")
-            media_ct = request.form.get("MediaContentType0", "")  # e.g. audio/ogg, audio/mpeg
-            logger.debug("Incoming Twilio media: url=%s content-type=%s", media_url, media_ct)
-
-            # quick account-match diagnostic: ensure media_url account matches TWILIO_ACCOUNT_SID
-            try:
-                if media_url and TWILIO_ACCOUNT_SID and f"/Accounts/{TWILIO_ACCOUNT_SID}/" not in media_url:
-                    logger.warning("Media URL account mismatch: media_url=%s, expected account sid=%s", media_url, TWILIO_ACCOUNT_SID)
-            except Exception:
-                logger.debug("Skipping account match check due to parse error")
-
-            # map content-type to extension
-            ext = ".bin"
-            if "ogg" in media_ct or "opus" in media_ct:
-                ext = ".ogg"
-            elif "mpeg" in media_ct or "mp3" in media_ct:
-                ext = ".mp3"
-            elif "wav" in media_ct:
-                ext = ".wav"
-
-            try:
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    raw_path = os.path.join(tmpdir, f"incoming_media{ext}")
-
-                    acct = TWILIO_ACCOUNT_SID.strip() if TWILIO_ACCOUNT_SID else ""
-                    token = TWILIO_AUTH_TOKEN.strip() if TWILIO_AUTH_TOKEN else ""
-                    auth_tuple = (acct, token) if (acct and token) else None
-
-                    logger.info("Media fetch will attempt auth=%s, account_sid_present=%s", bool(auth_tuple), bool(acct))
-
-                    # Use robust multi-strategy downloader
-                    download_media(media_url, raw_path, auth=auth_tuple, timeout=30)
-
-                    # transcription attempts
-                    transcription = transcribe_with_openai(raw_path)
-                    if not transcription:
-                        mp3_path = os.path.join(tmpdir, "converted.mp3")
-                        try:
-                            convert_to_mp3(raw_path, mp3_path)
-                            transcription = transcribe_with_openai(mp3_path)
-                        except subprocess.CalledProcessError as cpe:
-                            logger.exception("ffmpeg conversion failed: %s", cpe)
-                    user_input = transcription or "[voice message received but could not transcribe]"
-
-                    if DEBUG_SAVE_MEDIA:
-                        save_dest = os.path.join(os.getcwd(), f"debug_media_{os.path.basename(raw_path)}")
-                        with open(raw_path, "rb") as rfh, open(save_dest, "wb") as wfh:
-                            wfh.write(rfh.read())
-                        logger.info("Saved debug media to %s", save_dest)
-            except requests.HTTPError as http_err:
-                logger.exception("HTTP error processing incoming media: %s", http_err)
-                user_input = "[error processing voice message - media fetch failed]"
-            except Exception as e:
-                logger.exception("Error processing incoming media: %s", e)
-                user_input = "[error processing voice message]"
-        else:
-            user_input = incoming_msg
-
-        if not user_input:
-            resp = MessagingResponse()
-            resp.message("👋 I didn’t receive any text. Please send a message.")
-            return str(resp), 200
-
-        reply = generate_reply_for_input(from_number, user_input)
-        resp = MessagingResponse()
-        resp.message(reply)
-        return str(resp), 200
-    except Exception as e:
-        logger.exception("Unhandled error in whatsapp_webhook: %s", e)
-        resp = MessagingResponse()
-        resp.message("Sorry, something went wrong processing your message.")
-        return str(resp), 500
-
-@app.route("/whatsapp-status", methods=["POST"])
-def whatsapp_status():
-    return ("", 204)
 
 # --- Meta Webhook ---
 @app.route("/meta-webhook", methods=["GET", "POST"])
@@ -963,7 +755,7 @@ def meta_webhook():
                                     if media_link:
                                         with tempfile.TemporaryDirectory() as tmpdir:
                                             raw_path = os.path.join(tmpdir, "voice_input")
-                                            download_media(media_link, raw_path)  # Meta link usually doesn't need Twilio auth
+                                            download_media(media_link, raw_path)
                                             transcription = transcribe_with_openai(raw_path)
                                             if not transcription:
                                                 mp3_path = os.path.join(tmpdir, "voice.mp3")

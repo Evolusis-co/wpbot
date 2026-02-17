@@ -1,6 +1,5 @@
 flask
 gunicorn
-twilio
 werkzeug
 python-dotenv
 requests
