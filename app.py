@@ -4,6 +4,7 @@ import json
 import logging
 import traceback
 import re
+import base64
 from datetime import datetime
 from flask import Flask, request, jsonify
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -335,9 +336,45 @@ def _build_button_id(phone_number: str, option_text: str, idx: int) -> str:
     return f"qr_{phone_suffix}_{idx}_{compact}"[:256]
 
 # --- Image Analysis with Vision API ---
-def analyze_image_with_vision(image_url: str, caption: str = "") -> str:
+
+def download_and_encode_image(image_url: str, media_id: str = "") -> str:
+    """Download image from Meta and encode as base64 data URL."""
+    logger.debug(f"download_and_encode_image called: url={image_url[:50] if image_url else 'N/A'}..., media_id={media_id}")
+    
+    if not image_url:
+        logger.error("No image URL provided")
+        return ""
+    
+    try:
+        headers = {}
+        if media_id and META_ACCESS_TOKEN:
+            headers["Authorization"] = f"Bearer {META_ACCESS_TOKEN}"
+        
+        logger.debug(f"Downloading image from: {image_url[:60]}...")
+        response = requests.get(image_url, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            image_data = response.content
+            content_type = response.headers.get('content-type', 'image/jpeg')
+            
+            # Encode as base64
+            image_b64 = base64.b64encode(image_data).decode('utf-8')
+            data_url = f"data:{content_type};base64,{image_b64}"
+            
+            logger.info(f"✅ Image downloaded and encoded: {len(image_data)} bytes")
+            return data_url
+        else:
+            logger.error(f"❌ Failed to download image: status {response.status_code}")
+            return ""
+            
+    except Exception as e:
+        logger.error(f"❌ Error downloading/encoding image: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return ""
+
+def analyze_image_with_vision(image_data_url: str, caption: str = "") -> str:
     """Analyze an image using OpenAI Vision API (gpt-4o)."""
-    logger.debug(f"analyze_image_with_vision called: url={image_url[:50]}..., caption={caption}")
+    logger.debug(f"analyze_image_with_vision called: image_len={len(image_data_url) if image_data_url else 0}, caption={caption}")
     
     if not openai_client:
         logger.error("OpenAI client not initialized for vision analysis")
@@ -352,7 +389,7 @@ def analyze_image_with_vision(image_url: str, caption: str = "") -> str:
         logger.info(f"Sending image to OpenAI Vision API with instruction: {instruction[:60]}...")
         
         response = openai_client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "user",
@@ -364,7 +401,7 @@ def analyze_image_with_vision(image_url: str, caption: str = "") -> str:
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": image_url
+                                "url": image_data_url
                             }
                         }
                     ]
@@ -402,7 +439,7 @@ def get_media_url_from_meta(media_id: str) -> str:
         if response.status_code == 200:
             body = response.json()
             media_url = body.get("url", "")
-            logger.info(f"✅ Media URL retrieved: {media_url[:60]}...")
+            logger.info(f"✅ Media URL retrieved for download")
             return media_url
         else:
             logger.error(f"❌ Failed to get media URL: status {response.status_code}")
@@ -427,13 +464,20 @@ def generate_response(phone_number: str, user_message: str, image_url: str = "")
         # If image provided, analyze it with vision
         image_analysis = ""
         if image_url:
-            logger.info(f"Image URL detected. Analyzing with vision API...")
-            image_analysis = analyze_image_with_vision(image_url, user_message)
-            if not user_message or user_message.strip() == "":
-                user_message = f"[User sent an image] {image_analysis}"
+            logger.info(f"Image URL detected. Downloading and analyzing with vision API...")
+            # First download and encode the image
+            image_data_url = download_and_encode_image(image_url)
+            if image_data_url:
+                image_analysis = analyze_image_with_vision(image_data_url, user_message)
+                if not user_message or user_message.strip() == "":
+                    user_message = f"[User sent an image] {image_analysis}"
+                else:
+                    user_message = f"{user_message}\n\n[Image context: {image_analysis}]"
+                logger.debug(f"Updated user message with image analysis: {len(user_message)} chars")
             else:
-                user_message = f"{user_message}\n\n[Image context: {image_analysis}]"
-            logger.debug(f"Updated user message with image analysis: {len(user_message)} chars")
+                logger.error("Failed to download/encode image")
+                # Continue without image analysis
+                user_message = user_message or "I couldn't download the image to analyze."
         
         history = get_conversation_history(phone_number)
         qdrant_results = _search_qdrant(user_message, QDRANT_TOP_K)
