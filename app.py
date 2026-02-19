@@ -409,6 +409,13 @@ def send_message_to_meta(phone_number: str, message_text: str) -> bool:
 
 # --- Flask Routes ---
 
+@app.route("/", methods=["GET", "HEAD"])
+def root():
+    """Root endpoint for platform probes."""
+    if request.method == "HEAD":
+        return "", 200
+    return jsonify({"status": "ok", "service": "whatsapp-bot"}), 200
+
 @app.route("/health", methods=["GET"])
 def health():
     """Health check endpoint."""
