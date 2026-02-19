@@ -5,6 +5,7 @@ import logging
 import traceback
 import re
 import base64
+import io
 from datetime import datetime
 from flask import Flask, request, jsonify
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -370,6 +371,76 @@ def download_and_encode_image(image_url: str, media_id: str = "") -> str:
     except Exception as e:
         logger.error(f"❌ Error downloading/encoding image: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
+        return ""
+
+
+def download_media_bytes(media_url: str) -> tuple:
+    """Download media from Meta and return bytes plus content type."""
+    logger.debug(f"download_media_bytes called: url={media_url[:50] if media_url else 'N/A'}...")
+
+    if not media_url:
+        logger.error("No media URL provided")
+        return b"", ""
+
+    try:
+        headers = {}
+        if META_ACCESS_TOKEN:
+            headers["Authorization"] = f"Bearer {META_ACCESS_TOKEN}"
+
+        response = requests.get(media_url, headers=headers, timeout=30)
+        if response.status_code == 200:
+            content_type = response.headers.get("content-type", "")
+            logger.info("✅ Media downloaded: %s bytes", len(response.content))
+            return response.content, content_type
+
+        logger.error("❌ Failed to download media: status %s", response.status_code)
+        return b"", ""
+    except Exception as e:
+        logger.error("❌ Error downloading media: %s", e)
+        logger.error("Traceback: %s", traceback.format_exc())
+        return b"", ""
+
+
+def _guess_audio_extension(content_type: str) -> str:
+    mapping = {
+        "audio/ogg": "ogg",
+        "audio/mpeg": "mp3",
+        "audio/wav": "wav",
+        "audio/mp4": "m4a",
+        "audio/amr": "amr",
+        "audio/3gpp": "3gp",
+        "audio/x-m4a": "m4a",
+    }
+    return mapping.get(content_type, "audio")
+
+
+def transcribe_audio_from_meta(media_url: str) -> str:
+    """Transcribe WhatsApp audio using OpenAI speech-to-text."""
+    logger.debug("transcribe_audio_from_meta called")
+
+    if not openai_client:
+        logger.error("OpenAI client not initialized for transcription")
+        return ""
+
+    audio_bytes, content_type = download_media_bytes(media_url)
+    if not audio_bytes:
+        return ""
+
+    try:
+        ext = _guess_audio_extension(content_type)
+        audio_file = io.BytesIO(audio_bytes)
+        audio_file.name = f"audio.{ext}"
+
+        response = openai_client.audio.transcriptions.create(
+            model="gpt-4o-mini-transcribe",
+            file=audio_file
+        )
+        transcript = str(getattr(response, "text", "") or "").strip()
+        logger.info("✅ Audio transcription complete: %s chars", len(transcript))
+        return transcript
+    except Exception as e:
+        logger.error("❌ Audio transcription error: %s", e)
+        logger.error("Traceback: %s", traceback.format_exc())
         return ""
 
 def analyze_image_with_vision(image_data_url: str, caption: str = "") -> str:
@@ -762,6 +833,26 @@ def meta_webhook_post():
                         else:
                             logger.warning("No media_id in image message")
                             user_input = "I didn't receive a valid image. Please try again."
+
+                    elif msg_type == "audio":
+                        audio_data = msg.get("audio", {})
+                        media_id = audio_data.get("id", "")
+
+                        logger.info("Audio message received: media_id=%s", media_id)
+
+                        if media_id:
+                            audio_url = get_media_url_from_meta(media_id)
+                            if audio_url:
+                                transcript = transcribe_audio_from_meta(audio_url)
+                                if transcript:
+                                    user_input = transcript
+                                    logger.info("Audio transcript: %s chars", len(transcript))
+                                else:
+                                    user_input = "I couldn't transcribe that audio. Please try again."
+                            else:
+                                user_input = "I couldn't download the audio. Please try again."
+                        else:
+                            user_input = "I didn't receive a valid audio message. Please try again."
 
                     elif msg_type == "interactive":
                         interactive = msg.get("interactive", {})
