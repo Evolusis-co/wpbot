@@ -3,6 +3,7 @@ import os
 import json
 import logging
 import traceback
+import re
 from datetime import datetime
 from flask import Flask, request, jsonify
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -72,6 +73,7 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_
 # --- Conversation Memory (for multi-turn context) ---
 conversation_memory = {}  # Maps phone_number -> [{"role": "user"|"assistant", "content": "..."}, ...]
 MAX_HISTORY_TURNS = 10
+QUICK_REPLY_PATTERN = re.compile(r"\[QUICK_REPLIES:\s*([^\]]+)\]", re.IGNORECASE)
 
 def get_conversation_history(phone_number: str) -> list:
     """Retrieve conversation history for a user."""
@@ -282,6 +284,24 @@ def _search_qdrant(query: str, limit: int = 3) -> list:
         logger.error("Traceback: %s", traceback.format_exc())
         return _search_qdrant_lexical_fallback(query, limit)
 
+
+def _parse_quick_replies(message_text: str):
+    text = str(message_text or "")
+    match = QUICK_REPLY_PATTERN.search(text)
+    if not match:
+        return text.strip(), []
+
+    options_raw = match.group(1)
+    options = [option.strip() for option in options_raw.split("|") if option.strip()]
+    cleaned_text = QUICK_REPLY_PATTERN.sub("", text).strip()
+    return cleaned_text, options
+
+
+def _build_button_id(phone_number: str, option_text: str, idx: int) -> str:
+    compact = re.sub(r"[^a-zA-Z0-9]+", "_", option_text).strip("_").lower()[:24] or f"opt_{idx}"
+    phone_suffix = str(phone_number)[-6:]
+    return f"qr_{phone_suffix}_{idx}_{compact}"[:256]
+
 # --- OpenAI Response Generation ---
 def generate_response(phone_number: str, user_message: str) -> str:
     """Generate a response using OpenAI with conversation history."""
@@ -356,14 +376,40 @@ def send_message_to_meta(phone_number: str, message_text: str) -> bool:
     
     url = f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/messages"
     
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone_number,
-        "type": "text",
-        "text": {
-            "body": message_text
+    clean_text, quick_replies = _parse_quick_replies(message_text)
+
+    if quick_replies:
+        buttons = []
+        for idx, option in enumerate(quick_replies[:3], start=1):
+            button_title = option[:20]
+            buttons.append({
+                "type": "reply",
+                "reply": {
+                    "id": _build_button_id(phone_number, button_title, idx),
+                    "title": button_title
+                }
+            })
+
+        body_text = clean_text[:1024] if clean_text else "Please choose an option:"
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": phone_number,
+            "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "body": {"text": body_text},
+                "action": {"buttons": buttons}
+            }
         }
-    }
+    else:
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": phone_number,
+            "type": "text",
+            "text": {
+                "body": clean_text or "..."
+            }
+        }
     
     headers = {
         "Authorization": f"Bearer {META_ACCESS_TOKEN}",
@@ -514,29 +560,36 @@ def meta_webhook_post():
                     logger.info(f"Sender: {sender}")
                     logger.info(f"Type: {msg_type}")
                     logger.info(f"Timestamp: {timestamp}")
-                    
-                    # Handle text messages
+
+                    user_input = ""
+
                     if msg_type == "text":
-                        text_body = msg.get("text", {}).get("body", "")
-                        logger.info(f"Text message received: '{text_body}'")
-                        
-                        if not text_body:
-                            logger.warning("Empty text body")
-                            continue
-                        
-                        # Generate response
+                        user_input = msg.get("text", {}).get("body", "").strip()
+                        logger.info(f"Text message received: '{user_input}'")
+
+                    elif msg_type == "interactive":
+                        interactive = msg.get("interactive", {})
+                        button_reply = interactive.get("button_reply", {})
+                        user_input = (button_reply.get("title") or button_reply.get("id") or "").strip()
+                        logger.info(f"Interactive button selected: '{user_input}'")
+
+                    elif msg_type == "button":
+                        button = msg.get("button", {})
+                        user_input = (button.get("text") or button.get("payload") or "").strip()
+                        logger.info(f"Button message received: '{user_input}'")
+
+                    if user_input:
                         logger.info(f"Generating response for {sender}...")
-                        response_text = generate_response(sender, text_body)
+                        response_text = generate_response(sender, user_input)
                         logger.info(f"Generated response: '{response_text}'")
-                        
-                        # Send response
+
                         logger.info(f"Sending response back to {sender}...")
                         success = send_message_to_meta(sender, response_text)
-                        
+
                         if success:
-                            logger.info(f"✅ Message sent successfully")
+                            logger.info("✅ Message sent successfully")
                         else:
-                            logger.error(f"❌ Failed to send message")
+                            logger.error("❌ Failed to send message")
                     
                     else:
                         logger.debug(f"Ignoring non-text message type: {msg_type}")
