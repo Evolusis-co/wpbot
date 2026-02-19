@@ -3,7 +3,7 @@ services:
     name: bridgetext
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
     autoDeploy: true
     healthCheckPath: /health
     envVars:
@@ -12,7 +12,7 @@ services:
       - key: LOG_LEVEL
         value: INFO
       - key: GUNICORN_CMD_ARGS
-        value: --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+        value: --bind 0.0.0.0:$PORT --workers 1 --timeout 120
       - key: META_VERIFY_TOKEN
         sync: false
       - key: OPENAI_API_KEY

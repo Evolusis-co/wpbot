@@ -74,7 +74,7 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_
 # --- Conversation Memory (for multi-turn context) ---
 conversation_memory = {}  # Maps phone_number -> [{"role": "user"|"assistant", "content": "..."}, ...]
 MAX_HISTORY_TURNS = 10
-QUICK_REPLY_PATTERN = re.compile(r"\[QUICK_REPLIES:\s*([^\]]+)\]", re.IGNORECASE)
+QUICK_REPLY_PATTERN = re.compile(r"\[\s*QUICK[_ ]REPLIES\s*:\s*([^\]]+)\]", re.IGNORECASE)
 
 def get_conversation_history(phone_number: str) -> list:
     """Retrieve conversation history for a user."""
@@ -316,7 +316,7 @@ def _parse_quick_replies(message_text: str):
         return text.strip(), []
 
     options_raw = match.group(1)
-    options = [option.strip() for option in options_raw.split("|") if option.strip()]
+    options = [option.strip().strip('"\'') for option in options_raw.split("|") if option.strip()]
     cleaned_text = QUICK_REPLY_PATTERN.sub("", text).strip()
     return cleaned_text, options
 
@@ -403,6 +403,7 @@ def send_message_to_meta(phone_number: str, message_text: str) -> bool:
     clean_text, quick_replies = _parse_quick_replies(message_text)
 
     if quick_replies:
+        logger.info("Quick replies detected: %s", quick_replies)
         buttons = []
         for idx, option in enumerate(quick_replies[:3], start=1):
             button_title = option[:20]
@@ -425,6 +426,7 @@ def send_message_to_meta(phone_number: str, message_text: str) -> bool:
                 "action": {"buttons": buttons}
             }
         }
+        logger.info("Sending interactive button message to %s", phone_number)
     else:
         payload = {
             "messaging_product": "whatsapp",
@@ -434,6 +436,7 @@ def send_message_to_meta(phone_number: str, message_text: str) -> bool:
                 "body": clean_text or "..."
             }
         }
+        logger.info("Sending plain text message to %s", phone_number)
     
     headers = {
         "Authorization": f"Bearer {META_ACCESS_TOKEN}",
