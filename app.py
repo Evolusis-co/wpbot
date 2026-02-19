@@ -321,6 +321,14 @@ def _parse_quick_replies(message_text: str):
     return cleaned_text, options
 
 
+def _normalize_human_punctuation(text: str) -> str:
+    normalized = str(text or "")
+    normalized = normalized.replace("—", " - ").replace("–", " - ")
+    normalized = re.sub(r"[ \t]{2,}", " ", normalized)
+    normalized = re.sub(r" *\n *", "\n", normalized)
+    return normalized.strip()
+
+
 def _build_button_id(phone_number: str, option_text: str, idx: int) -> str:
     compact = re.sub(r"[^a-zA-Z0-9]+", "_", option_text).strip("_").lower()[:24] or f"opt_{idx}"
     phone_suffix = str(phone_number)[-6:]
@@ -374,7 +382,7 @@ def generate_response(phone_number: str, user_message: str) -> str:
             max_tokens=500
         )
         
-        assistant_message = response.choices[0].message.content
+        assistant_message = _normalize_human_punctuation(response.choices[0].message.content)
         logger.info(f"✅ OpenAI response generated for {phone_number}: {len(assistant_message)} chars")
         logger.debug(f"OpenAI response: {assistant_message}")
         
@@ -392,6 +400,7 @@ def generate_response(phone_number: str, user_message: str) -> str:
 # --- Meta WhatsApp API Helpers ---
 def send_message_to_meta(phone_number: str, message_text: str) -> bool:
     """Send a message via Meta WhatsApp Cloud API."""
+    message_text = _normalize_human_punctuation(message_text)
     logger.debug(f"send_message_to_meta called: phone={phone_number}, text={message_text}")
     
     if not META_ACCESS_TOKEN or not META_PHONE_NUMBER_ID:
