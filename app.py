@@ -347,7 +347,7 @@ def download_and_encode_image(image_url: str, media_id: str = "") -> str:
     
     try:
         headers = {}
-        if media_id and META_ACCESS_TOKEN:
+        if META_ACCESS_TOKEN:
             headers["Authorization"] = f"Bearer {META_ACCESS_TOKEN}"
         
         logger.debug(f"Downloading image from: {image_url[:60]}...")
@@ -452,9 +452,11 @@ def get_media_url_from_meta(media_id: str) -> str:
         return ""
 
 # --- OpenAI Response Generation ---
-def generate_response(phone_number: str, user_message: str, image_url: str = "") -> str:
+def generate_response(phone_number: str, user_message: str, image_url: str = "", image_media_id: str = "") -> str:
     """Generate a response using OpenAI with conversation history."""
-    logger.debug(f"generate_response called for {phone_number}: {user_message}, image={bool(image_url)}")
+    logger.debug(
+        f"generate_response called for {phone_number}: {user_message}, image={bool(image_url)}, media_id={bool(image_media_id)}"
+    )
     
     if not openai_client:
         logger.error("OpenAI client not initialized")
@@ -466,7 +468,7 @@ def generate_response(phone_number: str, user_message: str, image_url: str = "")
         if image_url:
             logger.info(f"Image URL detected. Downloading and analyzing with vision API...")
             # First download and encode the image
-            image_data_url = download_and_encode_image(image_url)
+            image_data_url = download_and_encode_image(image_url, image_media_id)
             if image_data_url:
                 image_analysis = analyze_image_with_vision(image_data_url, user_message)
                 if not user_message or user_message.strip() == "":
@@ -735,6 +737,7 @@ def meta_webhook_post():
 
                     user_input = ""
                     image_url = ""
+                    image_media_id = ""
 
                     if msg_type == "text":
                         user_input = msg.get("text", {}).get("body", "").strip()
@@ -748,6 +751,7 @@ def meta_webhook_post():
                         logger.info(f"Image message received: media_id={media_id}, caption='{caption}'")
                         
                         if media_id:
+                            image_media_id = media_id
                             image_url = get_media_url_from_meta(media_id)
                             if image_url:
                                 logger.info(f"Image URL retrieved: {image_url[:60]}...")
@@ -772,7 +776,7 @@ def meta_webhook_post():
 
                     if user_input:
                         logger.info(f"Generating response for {sender}...")
-                        response_text = generate_response(sender, user_input, image_url)
+                        response_text = generate_response(sender, user_input, image_url, image_media_id)
                         logger.info(f"Generated response: '{response_text}'")
 
                         logger.info(f"Sending response back to {sender}...")
