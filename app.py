@@ -9,6 +9,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
 import requests
 from openai import OpenAI
+from prompts import SYSTEM_PROMPT_TEMPLATE
 
 # --- Environment Setup ---
 load_dotenv()
@@ -18,6 +19,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "").strip()
 META_PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "").strip()
 META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "stepbot_verify")
+QDRANT_URL = (os.getenv("QDRANT_URL") or os.getenv("QRANT_URL") or "").strip().rstrip("/")
+QDRANT_API_KEY = (os.getenv("QDRANT_API_KEY") or os.getenv("QRANT_API_KEY") or "").strip()
+QDRANT_COLLECTION = "bridgetext_scenarios"
+QDRANT_TOP_K = 3
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip()
 PORT = int(os.getenv("PORT", 10000))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -37,6 +43,11 @@ logger.info("OPENAI_API_KEY present: %s", bool(OPENAI_API_KEY))
 logger.info("META_ACCESS_TOKEN present: %s", bool(META_ACCESS_TOKEN))
 logger.info("META_PHONE_NUMBER_ID: %s", META_PHONE_NUMBER_ID)
 logger.info("META_VERIFY_TOKEN present: %s", bool(META_VERIFY_TOKEN))
+logger.info("QDRANT_URL present: %s", bool(QDRANT_URL))
+logger.info("QDRANT_API_KEY present: %s", bool(QDRANT_API_KEY))
+logger.info("QDRANT_COLLECTION: %s", QDRANT_COLLECTION)
+logger.info("QDRANT_TOP_K: %s", QDRANT_TOP_K)
+logger.info("OPENAI_EMBEDDING_MODEL: %s", OPENAI_EMBEDDING_MODEL)
 logger.info("PORT: %s", PORT)
 logger.info("LOG_LEVEL: %s", LOG_LEVEL)
 logger.info("=" * 80)
@@ -82,6 +93,195 @@ def save_message_to_history(phone_number: str, role: str, content: str):
     
     logger.debug(f"Saved message to history for {phone_number}: role={role}, len(history)={len(conversation_memory[phone_number])}")
 
+
+def _format_chat_history_for_prompt(history: list) -> str:
+    if not history:
+        return "No previous messages."
+    lines = []
+    for message in history[-(MAX_HISTORY_TURNS * 2):]:
+        role = message.get("role", "user").upper()
+        content = str(message.get("content", "")).strip()
+        if content:
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines) if lines else "No previous messages."
+
+
+def _build_knowledge_context(results: list) -> str:
+    if not results:
+        return "No relevant knowledge base context retrieved."
+
+    sections = []
+    for idx, item in enumerate(results, start=1):
+        payload = item.get("payload") or {}
+        title = payload.get("scenario_title", "Untitled Scenario")
+        category = payload.get("category", "Unknown Category")
+        tags = payload.get("tags") or []
+        when_to_use = payload.get("when_to_use", "")
+        signals = payload.get("signals", "")
+        recommended_action = payload.get("recommended_action", "")
+        content = str(payload.get("content", "")).strip()
+        snippet = content[:1200]
+
+        signals_text = ", ".join(signals) if isinstance(signals, list) else str(signals or "")
+
+        sections.append(
+            f"[{idx}] Title: {title}\n"
+            f"Category: {category}\n"
+            f"Tags: {', '.join(tags) if tags else 'none'}\n"
+            f"when_to_use: {when_to_use or 'n/a'}\n"
+            f"signals: {signals_text or 'n/a'}\n"
+            f"recommended_action: {recommended_action or 'n/a'}\n"
+            f"Content:\n{snippet}"
+        )
+
+    return "\n\n---\n\n".join(sections)
+
+
+def _embed_user_query(query: str):
+    if not openai_client:
+        logger.warning("Skipping embedding because OpenAI client is not initialized")
+        return None
+
+    try:
+        embedding_response = openai_client.embeddings.create(
+            model=OPENAI_EMBEDDING_MODEL,
+            input=query
+        )
+        vector = embedding_response.data[0].embedding
+        logger.debug("Created query embedding with %s dimensions", len(vector))
+        return vector
+    except Exception as e:
+        logger.error("❌ Failed to create query embedding: %s", e)
+        logger.error("Traceback: %s", traceback.format_exc())
+        return None
+
+
+def _keyword_score(query: str, payload: dict) -> int:
+    query_tokens = {token for token in query.lower().split() if len(token) > 2}
+    if not query_tokens:
+        return 0
+
+    text_fields = [
+        str(payload.get("scenario_title", "")),
+        str(payload.get("category", "")),
+        str(payload.get("content", "")),
+        str(payload.get("when_to_use", "")),
+        str(payload.get("recommended_action", "")),
+        " ".join(payload.get("tags", []) if isinstance(payload.get("tags"), list) else []),
+    ]
+    corpus = " ".join(text_fields).lower()
+
+    return sum(1 for token in query_tokens if token in corpus)
+
+
+def _search_qdrant_lexical_fallback(query: str, limit: int = 3) -> list:
+    if not QDRANT_URL or not QDRANT_API_KEY:
+        return []
+
+    headers = {
+        "api-key": QDRANT_API_KEY,
+        "Content-Type": "application/json"
+    }
+    scroll_url = f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}/points/scroll"
+    scroll_payload = {
+        "limit": 200,
+        "with_payload": True,
+        "with_vector": False
+    }
+
+    try:
+        logger.debug("Qdrant lexical fallback request URL: %s", scroll_url)
+        resp = requests.post(scroll_url, headers=headers, json=scroll_payload, timeout=30)
+        if resp.status_code != 200:
+            logger.error("Lexical fallback failed with status %s", resp.status_code)
+            logger.error("Lexical fallback response: %s", resp.text)
+            return []
+
+        body = resp.json()
+        points = body.get("result", {}).get("points", [])
+        ranked = sorted(
+            points,
+            key=lambda point: _keyword_score(query, point.get("payload") or {}),
+            reverse=True,
+        )
+        top_points = [point for point in ranked if _keyword_score(query, point.get("payload") or {}) > 0][:limit]
+        logger.info("✅ Qdrant lexical fallback returned %s ranked results", len(top_points))
+        return top_points
+    except Exception as e:
+        logger.error("❌ Qdrant lexical fallback failed: %s", e)
+        logger.error("Traceback: %s", traceback.format_exc())
+        return []
+
+
+def _search_qdrant(query: str, limit: int = 3) -> list:
+    if not QDRANT_URL or not QDRANT_API_KEY:
+        logger.info("Qdrant is not configured. Skipping retrieval.")
+        return []
+
+    vector = _embed_user_query(query)
+    if not vector:
+        return []
+
+    headers = {
+        "api-key": QDRANT_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    search_url = f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}/points/search"
+    search_payload = {
+        "vector": vector,
+        "limit": limit,
+        "with_payload": True,
+        "with_vector": False
+    }
+
+    try:
+        logger.debug("Qdrant search request URL: %s", search_url)
+        search_response = requests.post(search_url, headers=headers, json=search_payload, timeout=30)
+        if search_response.status_code == 200:
+            body = search_response.json()
+            results = body.get("result", [])
+            logger.info("✅ Qdrant search success. Results: %s", len(results))
+            if results:
+                return results
+
+            logger.warning("Qdrant vector search returned 0 results; trying lexical fallback")
+            return _search_qdrant_lexical_fallback(query, limit)
+
+        logger.warning("Qdrant /points/search returned %s; trying /points/query fallback", search_response.status_code)
+    except Exception as e:
+        logger.warning("Qdrant /points/search request failed: %s", e)
+
+    query_url = f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}/points/query"
+    query_payload = {
+        "query": vector,
+        "limit": limit,
+        "with_payload": True,
+        "with_vector": False
+    }
+
+    try:
+        logger.debug("Qdrant query request URL: %s", query_url)
+        query_response = requests.post(query_url, headers=headers, json=query_payload, timeout=30)
+        if query_response.status_code != 200:
+            logger.error("❌ Qdrant query failed with status %s", query_response.status_code)
+            logger.error("Qdrant response: %s", query_response.text)
+            return _search_qdrant_lexical_fallback(query, limit)
+
+        body = query_response.json()
+        result = body.get("result", {})
+        points = result.get("points", []) if isinstance(result, dict) else []
+        logger.info("✅ Qdrant query success. Results: %s", len(points))
+        if points:
+            return points
+
+        logger.warning("Qdrant query returned 0 results; trying lexical fallback")
+        return _search_qdrant_lexical_fallback(query, limit)
+    except Exception as e:
+        logger.error("❌ Qdrant query request failed: %s", e)
+        logger.error("Traceback: %s", traceback.format_exc())
+        return _search_qdrant_lexical_fallback(query, limit)
+
 # --- OpenAI Response Generation ---
 def generate_response(phone_number: str, user_message: str) -> str:
     """Generate a response using OpenAI with conversation history."""
@@ -92,27 +292,34 @@ def generate_response(phone_number: str, user_message: str) -> str:
         return "Sorry, I'm temporarily unavailable. Please try again later."
     
     try:
-        # Build messages list with system prompt and history
+        history = get_conversation_history(phone_number)
+        qdrant_results = _search_qdrant(user_message, QDRANT_TOP_K)
+        knowledge_context = _build_knowledge_context(qdrant_results)
+        history_text = _format_chat_history_for_prompt(history)
+
+        system_prompt = (
+            f"{SYSTEM_PROMPT_TEMPLATE.strip()}\n\n"
+            f"CONTEXT:\n{knowledge_context}\n\n"
+            f"CHAT_HISTORY:\n{history_text}\n\n"
+            "INSTRUCTION: Use the context when relevant. If context is not relevant, respond naturally without fabricating facts."
+        )
+
+        # Build messages list with prompt and history
         messages = [
             {
                 "role": "system",
-                "content": (
-                    "You are a helpful WhatsApp bot powered by OpenAI. "
-                    "You provide concise, friendly responses to user messages. "
-                    "Keep responses brief and practical. "
-                    "Always be respectful and professional."
-                )
+                "content": system_prompt
             }
         ]
         
         # Add conversation history
-        history = get_conversation_history(phone_number)
         messages.extend(history)
         
         # Add current user message
         messages.append({"role": "user", "content": user_message})
         
         logger.debug(f"Sending {len(messages)} messages to OpenAI (including system prompt and history)")
+        logger.debug("Qdrant context docs used: %s", len(qdrant_results))
         logger.debug(f"Messages summary: {[m['role'] for m in messages]}")
         
         # Call OpenAI
