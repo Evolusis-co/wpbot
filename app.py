@@ -334,16 +334,107 @@ def _build_button_id(phone_number: str, option_text: str, idx: int) -> str:
     phone_suffix = str(phone_number)[-6:]
     return f"qr_{phone_suffix}_{idx}_{compact}"[:256]
 
+# --- Image Analysis with Vision API ---
+def analyze_image_with_vision(image_url: str, caption: str = "") -> str:
+    """Analyze an image using OpenAI Vision API (gpt-4o)."""
+    logger.debug(f"analyze_image_with_vision called: url={image_url[:50]}..., caption={caption}")
+    
+    if not openai_client:
+        logger.error("OpenAI client not initialized for vision analysis")
+        return "Sorry, I couldn't analyze the image. Please try again."
+    
+    try:
+        if caption:
+            instruction = f"Answer this question using the image context: {caption}"
+        else:
+            instruction = "Please describe what's in this image concisely in 2-3 sentences."
+        
+        logger.info(f"Sending image to OpenAI Vision API with instruction: {instruction[:60]}...")
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": instruction
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_url
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=300
+        )
+        
+        vision_result = _normalize_human_punctuation(response.choices[0].message.content)
+        logger.info(f"✅ Vision API analysis successful: {len(vision_result)} chars")
+        logger.debug(f"Vision result: {vision_result}")
+        
+        return vision_result
+        
+    except Exception as e:
+        logger.error(f"❌ Vision API error: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return "I had trouble analyzing that image. Please try again."
+
+def get_media_url_from_meta(media_id: str) -> str:
+    """Retrieve the download URL for a media file from Meta."""
+    logger.debug(f"get_media_url_from_meta called: media_id={media_id}")
+    
+    if not META_ACCESS_TOKEN:
+        logger.error("META_ACCESS_TOKEN not configured")
+        return ""
+    
+    try:
+        url = f"https://graph.facebook.com/v19.0/{media_id}"
+        headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+        
+        logger.debug(f"Fetching media URL from: {url}")
+        response = requests.get(url, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            body = response.json()
+            media_url = body.get("url", "")
+            logger.info(f"✅ Media URL retrieved: {media_url[:60]}...")
+            return media_url
+        else:
+            logger.error(f"❌ Failed to get media URL: status {response.status_code}")
+            logger.error(f"Response: {response.text}")
+            return ""
+            
+    except Exception as e:
+        logger.error(f"❌ Error retrieving media URL: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return ""
+
 # --- OpenAI Response Generation ---
-def generate_response(phone_number: str, user_message: str) -> str:
+def generate_response(phone_number: str, user_message: str, image_url: str = "") -> str:
     """Generate a response using OpenAI with conversation history."""
-    logger.debug(f"generate_response called for {phone_number}: {user_message}")
+    logger.debug(f"generate_response called for {phone_number}: {user_message}, image={bool(image_url)}")
     
     if not openai_client:
         logger.error("OpenAI client not initialized")
         return "Sorry, I'm temporarily unavailable. Please try again later."
     
     try:
+        # If image provided, analyze it with vision
+        image_analysis = ""
+        if image_url:
+            logger.info(f"Image URL detected. Analyzing with vision API...")
+            image_analysis = analyze_image_with_vision(image_url, user_message)
+            if not user_message or user_message.strip() == "":
+                user_message = f"[User sent an image] {image_analysis}"
+            else:
+                user_message = f"{user_message}\n\n[Image context: {image_analysis}]"
+            logger.debug(f"Updated user message with image analysis: {len(user_message)} chars")
+        
         history = get_conversation_history(phone_number)
         qdrant_results = _search_qdrant(user_message, QDRANT_TOP_K)
         knowledge_context = _build_knowledge_context(qdrant_results)
@@ -353,7 +444,8 @@ def generate_response(phone_number: str, user_message: str) -> str:
             f"{SYSTEM_PROMPT_TEMPLATE.strip()}\n\n"
             f"CONTEXT:\n{knowledge_context}\n\n"
             f"CHAT_HISTORY:\n{history_text}\n\n"
-            "INSTRUCTION: Use the context when relevant. If context is not relevant, respond naturally without fabricating facts."
+            "INSTRUCTION: Keep your responses concise (under 150 words). Be direct and on-point. "
+            "Use the context when relevant. If context is not relevant, respond naturally without fabricating facts."
         )
 
         # Build messages list with prompt and history
@@ -379,7 +471,7 @@ def generate_response(phone_number: str, user_message: str) -> str:
             model="gpt-4o-mini",
             messages=messages,
             temperature=0.7,
-            max_tokens=500
+            max_tokens=300
         )
         
         assistant_message = _normalize_human_punctuation(response.choices[0].message.content)
@@ -598,10 +690,30 @@ def meta_webhook_post():
                     logger.info(f"Timestamp: {timestamp}")
 
                     user_input = ""
+                    image_url = ""
 
                     if msg_type == "text":
                         user_input = msg.get("text", {}).get("body", "").strip()
                         logger.info(f"Text message received: '{user_input}'")
+
+                    elif msg_type == "image":
+                        image_data = msg.get("image", {})
+                        media_id = image_data.get("id", "")
+                        caption = image_data.get("caption", "").strip()
+                        
+                        logger.info(f"Image message received: media_id={media_id}, caption='{caption}'")
+                        
+                        if media_id:
+                            image_url = get_media_url_from_meta(media_id)
+                            if image_url:
+                                logger.info(f"Image URL retrieved: {image_url[:60]}...")
+                                user_input = caption or "[Image sent]"
+                            else:
+                                logger.error("Failed to retrieve image URL")
+                                user_input = "I couldn't download the image. Please try again."
+                        else:
+                            logger.warning("No media_id in image message")
+                            user_input = "I didn't receive a valid image. Please try again."
 
                     elif msg_type == "interactive":
                         interactive = msg.get("interactive", {})
@@ -616,7 +728,7 @@ def meta_webhook_post():
 
                     if user_input:
                         logger.info(f"Generating response for {sender}...")
-                        response_text = generate_response(sender, user_input)
+                        response_text = generate_response(sender, user_input, image_url)
                         logger.info(f"Generated response: '{response_text}'")
 
                         logger.info(f"Sending response back to {sender}...")
