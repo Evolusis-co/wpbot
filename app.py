@@ -22,11 +22,12 @@ META_PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "").strip()
 META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "stepbot_verify")
 QDRANT_URL = (os.getenv("QDRANT_URL") or os.getenv("QRANT_URL") or "").strip().rstrip("/")
 QDRANT_API_KEY = (os.getenv("QDRANT_API_KEY") or os.getenv("QRANT_API_KEY") or "").strip()
-QDRANT_COLLECTION = "bridgetext_scenarios"
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "bridgetext_scenarios").strip() or "bridgetext_scenarios"
 QDRANT_TOP_K = 3
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip()
 PORT = int(os.getenv("PORT", 10000))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+qdrant_collection_missing = False
 
 # --- Logging Configuration (EXTREME for Render debugging) ---
 logging.basicConfig(
@@ -177,7 +178,12 @@ def _keyword_score(query: str, payload: dict) -> int:
 
 
 def _search_qdrant_lexical_fallback(query: str, limit: int = 3) -> list:
+    global qdrant_collection_missing
+
     if not QDRANT_URL or not QDRANT_API_KEY:
+        return []
+
+    if qdrant_collection_missing:
         return []
 
     headers = {
@@ -194,6 +200,10 @@ def _search_qdrant_lexical_fallback(query: str, limit: int = 3) -> list:
     try:
         logger.debug("Qdrant lexical fallback request URL: %s", scroll_url)
         resp = requests.post(scroll_url, headers=headers, json=scroll_payload, timeout=30)
+        if resp.status_code == 404:
+            qdrant_collection_missing = True
+            logger.warning("Qdrant collection '%s' not found. Disabling retrieval until restart.", QDRANT_COLLECTION)
+            return []
         if resp.status_code != 200:
             logger.error("Lexical fallback failed with status %s", resp.status_code)
             logger.error("Lexical fallback response: %s", resp.text)
@@ -216,8 +226,14 @@ def _search_qdrant_lexical_fallback(query: str, limit: int = 3) -> list:
 
 
 def _search_qdrant(query: str, limit: int = 3) -> list:
+    global qdrant_collection_missing
+
     if not QDRANT_URL or not QDRANT_API_KEY:
         logger.info("Qdrant is not configured. Skipping retrieval.")
+        return []
+
+    if qdrant_collection_missing:
+        logger.debug("Skipping Qdrant retrieval because collection is marked missing")
         return []
 
     vector = _embed_user_query(query)
@@ -240,6 +256,10 @@ def _search_qdrant(query: str, limit: int = 3) -> list:
     try:
         logger.debug("Qdrant search request URL: %s", search_url)
         search_response = requests.post(search_url, headers=headers, json=search_payload, timeout=30)
+        if search_response.status_code == 404:
+            qdrant_collection_missing = True
+            logger.warning("Qdrant collection '%s' not found. Disabling retrieval until restart.", QDRANT_COLLECTION)
+            return []
         if search_response.status_code == 200:
             body = search_response.json()
             results = body.get("result", [])
@@ -265,6 +285,10 @@ def _search_qdrant(query: str, limit: int = 3) -> list:
     try:
         logger.debug("Qdrant query request URL: %s", query_url)
         query_response = requests.post(query_url, headers=headers, json=query_payload, timeout=30)
+        if query_response.status_code == 404:
+            qdrant_collection_missing = True
+            logger.warning("Qdrant collection '%s' not found. Disabling retrieval until restart.", QDRANT_COLLECTION)
+            return []
         if query_response.status_code != 200:
             logger.error("❌ Qdrant query failed with status %s", query_response.status_code)
             logger.error("Qdrant response: %s", query_response.text)
