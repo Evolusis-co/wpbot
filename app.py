@@ -69,31 +69,39 @@ def get_user_by_phone(whatsapp_number: str) -> dict:
     We try an exact match first, then strip the leading country code.
     Returns a dict with user fields or an empty dict if not found.
     """
+    if not whatsapp_number:
+        logger.debug("No WhatsApp number provided for user lookup")
+        return {}
+
     if not DATABASE_URL:
         logger.debug("DATABASE_URL not set – skipping user lookup")
         return {}
 
-    # Normalise: ensure we try both with and without leading country digits
-    candidates = [whatsapp_number]
-    # If number starts with a 1-3 digit country code (e.g. 91, 1, 44)
-    for prefix_len in (2, 1, 3):
-        if len(whatsapp_number) > prefix_len + 7:
-            candidates.append(whatsapp_number[prefix_len:])
+    # Normalize incoming number to digits and try common suffix lengths.
+    normalized = re.sub(r"\D", "", str(whatsapp_number))
+    if not normalized:
+        return {}
+
+    candidates = {normalized}
+    for length in (10, 11, 12):
+        if len(normalized) >= length:
+            candidates.add(normalized[-length:])
 
     try:
         conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
         conn.autocommit = True
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            placeholders = ",".join(["%s"] * len(candidates))
+            candidate_list = list(candidates)
+            placeholders = ",".join(["%s"] * len(candidate_list))
             cur.execute(
                 f"""
                 SELECT user_id, email, first_name, last_name,
                        phone_number, user_type, training_role, company_id
                 FROM public.users
-                WHERE phone_number IN ({placeholders})
+                WHERE regexp_replace(coalesce(phone_number, ''), '\\D', '', 'g') IN ({placeholders})
                 LIMIT 1
                 """,
-                candidates,
+                candidate_list,
             )
             row = cur.fetchone()
         conn.close()
