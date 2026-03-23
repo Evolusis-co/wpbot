@@ -938,6 +938,16 @@ def meta_webhook_post():
                         logger.info(f"Button message received: '{user_input}'")
 
                     if user_input:
+                        # Gate: only registered users may use the bot
+                        if not get_user_by_phone(sender):
+                            logger.info("Unregistered number %s – sending redirect message", sender)
+                            send_message_to_meta(
+                                sender,
+                                "Sorry, you are not registered to use this service. "
+                                "Please visit https://evolusis.com/ to get access."
+                            )
+                            continue
+
                         logger.info(f"Generating response for {sender}...")
                         response_text = generate_response(sender, user_input, image_url, image_media_id)
                         logger.info(f"Generated response: '{response_text}'")
