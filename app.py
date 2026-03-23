@@ -11,6 +11,8 @@ from flask import Flask, request, jsonify
 from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
 import requests
+import psycopg2
+import psycopg2.extras
 from openai import OpenAI
 from prompts import SYSTEM_PROMPT_TEMPLATE
 
@@ -27,6 +29,7 @@ QDRANT_API_KEY = (os.getenv("QDRANT_API_KEY") or os.getenv("QRANT_API_KEY") or "
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "bridgetext_scenarios").strip() or "bridgetext_scenarios"
 QDRANT_TOP_K = 3
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PORT = int(os.getenv("PORT", 10000))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 qdrant_collection_missing = False
@@ -52,11 +55,64 @@ logger.info("QDRANT_API_KEY present: %s", bool(QDRANT_API_KEY))
 logger.info("QDRANT_COLLECTION: %s", QDRANT_COLLECTION)
 logger.info("QDRANT_TOP_K: %s", QDRANT_TOP_K)
 logger.info("OPENAI_EMBEDDING_MODEL: %s", OPENAI_EMBEDDING_MODEL)
+logger.info("DATABASE_URL present: %s", bool(DATABASE_URL))
 logger.info("PORT: %s", PORT)
 logger.info("LOG_LEVEL: %s", LOG_LEVEL)
 logger.info("=" * 80)
 
-# --- OpenAI Client Initialization ---
+# --- Database: Fetch User by Phone Number ---
+
+def get_user_by_phone(whatsapp_number: str) -> dict:
+    """
+    Look up a user in public.users by phone_number.
+    WhatsApp sends numbers like '919321503773' (no +).
+    We try an exact match first, then strip the leading country code.
+    Returns a dict with user fields or an empty dict if not found.
+    """
+    if not DATABASE_URL:
+        logger.debug("DATABASE_URL not set – skipping user lookup")
+        return {}
+
+    # Normalise: ensure we try both with and without leading country digits
+    candidates = [whatsapp_number]
+    # If number starts with a 1-3 digit country code (e.g. 91, 1, 44)
+    for prefix_len in (2, 1, 3):
+        if len(whatsapp_number) > prefix_len + 7:
+            candidates.append(whatsapp_number[prefix_len:])
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            placeholders = ",".join(["%s"] * len(candidates))
+            cur.execute(
+                f"""
+                SELECT user_id, email, first_name, last_name,
+                       phone_number, user_type, training_role, company_id
+                FROM public.users
+                WHERE phone_number IN ({placeholders})
+                LIMIT 1
+                """,
+                candidates,
+            )
+            row = cur.fetchone()
+        conn.close()
+
+        if row:
+            user = dict(row)
+            logger.info("✅ User found in DB: %s %s (id=%s)",
+                        user.get("first_name"), user.get("last_name"), user.get("user_id"))
+            return user
+
+        logger.info("No DB user found for number %s", whatsapp_number)
+        return {}
+
+    except Exception as exc:
+        logger.error("❌ DB lookup failed: %s", exc)
+        return {}
+
+
+
 openai_client = None
 if OPENAI_API_KEY:
     try:
@@ -557,9 +613,25 @@ def generate_response(phone_number: str, user_message: str, image_url: str = "",
         knowledge_context = _build_knowledge_context(qdrant_results)
         history_text = _format_chat_history_for_prompt(history)
 
+        # Build user info block from database
+        user_info = get_user_by_phone(phone_number)
+        if user_info:
+            first = (user_info.get("first_name") or "").strip()
+            last = (user_info.get("last_name") or "").strip()
+            full_name = f"{first} {last}".strip() or "User"
+            user_info_text = (
+                f"USER INFORMATION:\n"
+                f"- Name: {full_name}\n"
+                f"- Role: {user_info.get('training_role') or user_info.get('user_type') or 'Unknown'}\n"
+                f"- Email: {user_info.get('email') or 'N/A'}\n"
+            )
+        else:
+            user_info_text = ""
+
         system_prompt = (
             f"{SYSTEM_PROMPT_TEMPLATE.strip()}\n\n"
-            f"CONTEXT:\n{knowledge_context}\n\n"
+            + (f"{user_info_text}\n" if user_info_text else "")
+            + f"CONTEXT:\n{knowledge_context}\n\n"
             f"CHAT_HISTORY:\n{history_text}\n\n"
             "INSTRUCTION: Keep your responses concise (under 150 words). Be direct and on-point. "
             "Use the context when relevant. If context is not relevant, respond naturally without fabricating facts."
