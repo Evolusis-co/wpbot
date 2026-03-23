@@ -141,6 +141,7 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_
 conversation_memory = {}  # Maps phone_number -> [{"role": "user"|"assistant", "content": "..."}, ...]
 MAX_HISTORY_TURNS = 10
 QUICK_REPLY_PATTERN = re.compile(r"\[\s*QUICK[_ ]REPLIES\s*:\s*([^\]]+)\]", re.IGNORECASE)
+unregistered_notified_numbers = set()  # Numbers already told to visit evolusis.com
 
 def get_conversation_history(phone_number: str) -> list:
     """Retrieve conversation history for a user."""
@@ -948,12 +949,16 @@ def meta_webhook_post():
                     if user_input:
                         # Gate: only registered users may use the bot
                         if not get_user_by_phone(sender):
-                            logger.info("Unregistered number %s – sending redirect message", sender)
-                            send_message_to_meta(
-                                sender,
-                                "Sorry, you are not registered to use this service. "
-                                "Please visit https://evolusis.com/ to get access."
-                            )
+                            if sender not in unregistered_notified_numbers:
+                                logger.info("Unregistered number %s - sending redirect message once", sender)
+                                send_message_to_meta(
+                                    sender,
+                                    "Sorry, you are not registered to use this service. "
+                                    "Please visit https://evolusis.com/ to get access."
+                                )
+                                unregistered_notified_numbers.add(sender)
+                            else:
+                                logger.info("Unregistered number %s already notified - skipping reply", sender)
                             continue
 
                         logger.info(f"Generating response for {sender}...")
