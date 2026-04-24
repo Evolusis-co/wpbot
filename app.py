@@ -155,25 +155,13 @@ def get_user_by_email(email: str) -> dict:
 # WhatsApp sending
 # ---------------------------------------------------------------------------
 
-def send_whatsapp_message(phone: str, text: str) -> bool:
-    """Send a plain-text WhatsApp message via Meta Cloud API."""
-    if not META_ACCESS_TOKEN or not META_PHONE_NUMBER_ID:
-        logger.error("Meta credentials not configured")
-        return False
+WELCOME_TEMPLATE_NAME = os.getenv("WELCOME_TEMPLATE_NAME", "evolusis_welcome")
+WELCOME_TEMPLATE_LANG = os.getenv("WELCOME_TEMPLATE_LANG", "en")
 
-    # Normalize: digits only, no leading +
-    phone = re.sub(r"\D", "", phone)
-    if not phone:
-        logger.error("Invalid phone number after normalization")
-        return False
 
+def _post_to_meta(phone: str, payload: dict) -> bool:
+    """Send a payload to Meta WhatsApp Cloud API and log the full response."""
     url = f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/messages"
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "text",
-        "text": {"body": text}
-    }
     headers = {
         "Authorization": f"Bearer {META_ACCESS_TOKEN}",
         "Content-Type": "application/json"
@@ -186,7 +174,6 @@ def send_whatsapp_message(phone: str, text: str) -> bool:
             resp_body = resp.text
         logger.info("Meta API status=%s phone=%s body=%s", resp.status_code, phone, resp_body)
         if resp.status_code == 200:
-            # Meta can return 200 with an error object — check for it
             if isinstance(resp_body, dict) and resp_body.get("error"):
                 logger.error("❌ Meta returned 200 but with error: %s", resp_body["error"])
                 return False
@@ -195,26 +182,40 @@ def send_whatsapp_message(phone: str, text: str) -> bool:
         logger.error("❌ Meta API %s: %s", resp.status_code, resp_body)
         return False
     except Exception as exc:
-        logger.error("❌ send_whatsapp_message exception: %s", exc)
+        logger.error("❌ _post_to_meta exception: %s", exc)
         return False
+
+
+def send_template_message(phone: str, template_name: str, lang: str, params: list) -> bool:
+    """Send an approved WhatsApp message template with body parameters."""
+    if not META_ACCESS_TOKEN or not META_PHONE_NUMBER_ID:
+        logger.error("Meta credentials not configured")
+        return False
+    phone = re.sub(r"\D", "", phone)
+    if not phone:
+        logger.error("Invalid phone number after normalization")
+        return False
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": lang},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": p} for p in params]
+                }
+            ]
+        }
+    }
+    return _post_to_meta(phone, payload)
+
 
 # ---------------------------------------------------------------------------
 # Welcome message
 # ---------------------------------------------------------------------------
-
-WELCOME_MESSAGE = """\
-👋 Hey {first_name}, welcome to Evolusis!
-
-You've just joined a platform built to help sales professionals perform at their best.
-
-Here's what's in store for you:
-• 📚 A personalised playbook modelled on your top performers
-• 🤖 An AI coach ready to help with real workplace challenges
-• 🎯 AI roleplay so you can practise before the pressure is on
-• 📲 Nudges & updates delivered right here on WhatsApp
-
-Your growth journey starts now. Visit *evolusis.com* to explore your dashboard. 🚀"""
-
 
 def send_welcome(user: dict) -> bool:
     phone = (user.get("phone") or "").strip()
@@ -222,9 +223,8 @@ def send_welcome(user: dict) -> bool:
         logger.info("User id=%s has no phone – skipping welcome", user.get("id"))
         return False
     first_name = (user.get("first_name") or "there").strip()
-    message = WELCOME_MESSAGE.format(first_name=first_name)
     logger.info("Sending welcome to user id=%s phone=%s", user.get("id"), phone)
-    return send_whatsapp_message(phone, message)
+    return send_template_message(phone, WELCOME_TEMPLATE_NAME, WELCOME_TEMPLATE_LANG, [first_name])
 
 # ---------------------------------------------------------------------------
 # Poller – detect new sign-ups and welcome them
