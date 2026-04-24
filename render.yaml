@@ -21,7 +21,7 @@ services:
         sync: false
       - key: META_PHONE_NUMBER_ID
         sync: false
-      - key: QDRANT_URL
+      - key: DATABASE_URL
         sync: false
-      - key: QDRANT_API_KEY
-        sync: false
+      - key: POLL_INTERVAL
+        value: "60"

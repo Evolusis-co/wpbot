@@ -3,5 +3,4 @@ gunicorn
 werkzeug
 python-dotenv
 requests
-openai
 psycopg2-binary
