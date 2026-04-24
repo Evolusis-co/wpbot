@@ -50,28 +50,35 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_
 # We track which user IDs have already received a welcome message using a
 # local JSON file so the state survives app restarts.
 # ---------------------------------------------------------------------------
-_welcomed_lock = threading.Lock()
+_state_lock = threading.Lock()
 
 
-def _load_welcomed_ids() -> set:
+def _load_state() -> tuple:
+    """Returns (bot_start_time: datetime, welcomed_ids: set)."""
     try:
         if os.path.exists(WELCOMED_USERS_FILE):
             with open(WELCOMED_USERS_FILE, "r") as fh:
-                return set(json.load(fh).get("ids", []))
+                data = json.load(fh)
+            start_time = datetime.fromisoformat(data["start_time"])
+            ids = set(data.get("ids", []))
+            logger.info("Loaded state: start_time=%s, welcomed=%d", start_time.isoformat(), len(ids))
+            return start_time, ids
     except Exception as exc:
-        logger.error("Could not load %s: %s", WELCOMED_USERS_FILE, exc)
-    return set()
+        logger.warning("Could not load state file (%s) – treating as fresh start", exc)
+    now = datetime.utcnow()
+    return now, set()
 
 
-def _save_welcomed_ids(ids: set):
+def _save_state(start_time: datetime, ids: set):
     try:
         with open(WELCOMED_USERS_FILE, "w") as fh:
-            json.dump({"ids": list(ids)}, fh)
+            json.dump({"start_time": start_time.isoformat(), "ids": list(ids)}, fh)
     except Exception as exc:
-        logger.error("Could not save %s: %s", WELCOMED_USERS_FILE, exc)
+        logger.error("Could not save state: %s", exc)
 
 
-welcomed_ids: set = _load_welcomed_ids()
+bot_start_time, welcomed_ids = _load_state()
+logger.info("Bot start time (UTC): %s", bot_start_time.isoformat())
 
 # ---------------------------------------------------------------------------
 # Database helpers  (public.users schema)
@@ -214,30 +221,27 @@ def send_welcome(user: dict) -> bool:
 # Poller – detect new sign-ups and welcome them
 # ---------------------------------------------------------------------------
 
-def _mark_existing_as_welcomed():
-    """On startup, mark ALL current users as already welcomed so we never
-    send retrospective welcome messages to pre-existing accounts."""
-    global welcomed_ids
-    users = fetch_users_with_phone()
-    if not users:
-        return
-    with _welcomed_lock:
-        new_ids = {u["id"] for u in users} - welcomed_ids
-        if new_ids:
-            welcomed_ids |= new_ids
-            _save_welcomed_ids(welcomed_ids)
-            logger.info("Startup: marked %d pre-existing user(s) as welcomed", len(new_ids))
-
-
 def check_and_welcome_new_users():
-    """Query DB for users not yet welcomed and send them the welcome message."""
-    global welcomed_ids
+    """Welcome users created after bot_start_time who haven't been welcomed yet."""
+    global welcomed_ids, bot_start_time
     users = fetch_users_with_phone()
     if not users:
         return
 
-    with _welcomed_lock:
-        new_users = [u for u in users if u["id"] not in welcomed_ids]
+    new_users = []
+    for u in users:
+        if u["id"] in welcomed_ids:
+            continue
+        # Only welcome users created AFTER this bot instance started.
+        # created_at comes back as a timezone-aware datetime from psycopg2.
+        created = u.get("created_at")
+        if created is None:
+            continue
+        # Normalise to UTC naive for comparison
+        if hasattr(created, "utcoffset") and created.utcoffset() is not None:
+            created = created.replace(tzinfo=None) - created.utcoffset()
+        if created >= bot_start_time:
+            new_users.append(u)
 
     if not new_users:
         logger.debug("No new users to welcome")
@@ -252,9 +256,9 @@ def check_and_welcome_new_users():
             logger.warning("Failed to send welcome to user id=%s", user.get("id"))
 
     if sent:
-        with _welcomed_lock:
+        with _state_lock:
             welcomed_ids |= sent
-            _save_welcomed_ids(welcomed_ids)
+            _save_state(bot_start_time, welcomed_ids)
 
 
 def _poller_loop():
@@ -334,17 +338,44 @@ def notify_welcome():
 
     uid = user["id"]
 
-    with _welcomed_lock:
+    with _state_lock:
         if uid in welcomed_ids:
             return jsonify({"status": "already_welcomed", "user_id": uid}), 200
 
     success = send_welcome(user)
     if success:
-        with _welcomed_lock:
+        with _state_lock:
             welcomed_ids.add(uid)
-            _save_welcomed_ids(welcomed_ids)
+            _save_state(bot_start_time, welcomed_ids)
         return jsonify({"status": "welcome_sent", "user_id": uid}), 200
 
+    return jsonify({"error": "Failed to send welcome message"}), 500
+
+
+@app.route("/force-welcome", methods=["POST"])
+def force_welcome():
+    """Force-send a welcome message regardless of welcomed state (for testing).
+
+    Body (JSON): {"user_id": 5}  OR  {"phone": "919321503773"}
+    """
+    body = request.get_json(silent=True) or {}
+    user_id = body.get("user_id")
+    phone = body.get("phone")
+
+    if user_id:
+        user = get_user_by_id(int(user_id))
+    elif phone:
+        # Build a minimal user dict for direct phone test
+        user = {"id": 0, "first_name": "there", "phone": str(phone)}
+    else:
+        return jsonify({"error": "Provide user_id or phone"}), 400
+
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    success = send_welcome(user)
+    if success:
+        return jsonify({"status": "welcome_sent"}), 200
     return jsonify({"error": "Failed to send welcome message"}), 500
 
 
@@ -353,7 +384,11 @@ def trigger_check():
     """Manually trigger a new-user check (useful for testing)."""
     try:
         check_and_welcome_new_users()
-        return jsonify({"status": "ok", "welcomed_users_count": len(welcomed_ids)}), 200
+        return jsonify({
+            "status": "ok",
+            "welcomed_users_count": len(welcomed_ids),
+            "bot_start_time": bot_start_time.isoformat()
+        }), 200
     except Exception as exc:
         logger.error("trigger-check error: %s", exc)
         return jsonify({"error": str(exc)}), 500
@@ -373,14 +408,9 @@ def server_error(e):
 # Entry point
 # ---------------------------------------------------------------------------
 
-# Mark pre-existing users so they don't get a retrospective welcome
-_mark_existing_as_welcomed()
-
 # Start background poller
 _poller_thread = threading.Thread(target=_poller_loop, daemon=True)
 _poller_thread.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True, use_reloader=False)
-
-
