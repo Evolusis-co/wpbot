@@ -155,7 +155,7 @@ def get_user_by_email(email: str) -> dict:
 # WhatsApp sending
 # ---------------------------------------------------------------------------
 
-WELCOME_TEMPLATE_NAME = os.getenv("WELCOME_TEMPLATE_NAME", "evolusis_welcome")
+WELCOME_TEMPLATE_NAME = os.getenv("WELCOME_TEMPLATE_NAME", "wellcome")
 WELCOME_TEMPLATE_LANG = os.getenv("WELCOME_TEMPLATE_LANG", "en")
 
 
