@@ -156,7 +156,7 @@ def get_user_by_email(email: str) -> dict:
 # ---------------------------------------------------------------------------
 
 WELCOME_TEMPLATE_NAME = os.getenv("WELCOME_TEMPLATE_NAME", "evolusis_welcome")
-WELCOME_TEMPLATE_LANG = os.getenv("WELCOME_TEMPLATE_LANG", "en_US")
+WELCOME_TEMPLATE_LANG = os.getenv("WELCOME_TEMPLATE_LANG", "en")
 
 
 def _post_to_meta(phone: str, payload: dict) -> bool:
