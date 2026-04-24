@@ -156,7 +156,7 @@ def get_user_by_email(email: str) -> dict:
 # ---------------------------------------------------------------------------
 
 WELCOME_TEMPLATE_NAME = os.getenv("WELCOME_TEMPLATE_NAME", "evolusis_welcome")
-WELCOME_TEMPLATE_LANG = os.getenv("WELCOME_TEMPLATE_LANG", "en")
+WELCOME_TEMPLATE_LANG = os.getenv("WELCOME_TEMPLATE_LANG", "en_US")
 
 
 def _post_to_meta(phone: str, payload: dict) -> bool:
@@ -401,6 +401,37 @@ def trigger_check():
     except Exception as exc:
         logger.error("trigger-check error: %s", exc)
         return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/debug-send", methods=["POST"])
+def debug_send():
+    """Return the raw Meta API response – use for diagnosing template errors.
+
+    Body (JSON): {"phone": "919321503773", "lang": "en_US"}
+    """
+    body = request.get_json(silent=True) or {}
+    phone = re.sub(r"\D", "", str(body.get("phone", "919321503773")))
+    lang = body.get("lang", WELCOME_TEMPLATE_LANG)
+    url = f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "template",
+        "template": {
+            "name": WELCOME_TEMPLATE_NAME,
+            "language": {"code": lang},
+            "components": [
+                {"type": "body", "parameters": [{"type": "text", "text": "Suyash"}]}
+            ]
+        }
+    }
+    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    resp = requests.post(url, json=payload, headers=headers, timeout=30)
+    try:
+        resp_body = resp.json()
+    except Exception:
+        resp_body = resp.text
+    return jsonify({"http_status": resp.status_code, "meta_response": resp_body}), 200
 
 
 @app.errorhandler(404)
