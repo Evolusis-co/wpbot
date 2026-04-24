@@ -180,10 +180,19 @@ def send_whatsapp_message(phone: str, text: str) -> bool:
     }
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=30)
+        try:
+            resp_body = resp.json()
+        except Exception:
+            resp_body = resp.text
+        logger.info("Meta API status=%s phone=%s body=%s", resp.status_code, phone, resp_body)
         if resp.status_code == 200:
+            # Meta can return 200 with an error object — check for it
+            if isinstance(resp_body, dict) and resp_body.get("error"):
+                logger.error("❌ Meta returned 200 but with error: %s", resp_body["error"])
+                return False
             logger.info("✅ Message sent to %s", phone)
             return True
-        logger.error("❌ Meta API %s: %s", resp.status_code, resp.text)
+        logger.error("❌ Meta API %s: %s", resp.status_code, resp_body)
         return False
     except Exception as exc:
         logger.error("❌ send_whatsapp_message exception: %s", exc)
