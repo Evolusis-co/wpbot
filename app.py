@@ -47,34 +47,96 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_
 
 # ---------------------------------------------------------------------------
 # Welcomed-users persistence
-# We track which user IDs have already received a welcome message using a
-# local JSON file so the state survives app restarts.
+# Bot state is persisted in a single PostgreSQL table `bot_messages` that
+# records every message sent — template name, params, meta message ID and
+# timestamp.  On startup we derive bot_start_time and welcomed_ids from it
+# so the state survives Render restarts with zero local files needed.
 # ---------------------------------------------------------------------------
 _state_lock = threading.Lock()
 
+_INIT_SQL = """
+CREATE TABLE IF NOT EXISTS wpbot_messages (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER,
+    phone           TEXT,
+    template_name   TEXT        NOT NULL,
+    params          JSONB,
+    meta_message_id TEXT,
+    sent_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+def _ensure_table():
+    if not DATABASE_URL:
+        return
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(_INIT_SQL)
+        conn.close()
+    except Exception as exc:
+        logger.warning("Could not create bot_messages table: %s", exc)
+
 
 def _load_state() -> tuple:
-    """Returns (bot_start_time: datetime, welcomed_ids: set)."""
+    """Returns (bot_start_time: datetime, welcomed_ids: set) derived from bot_messages."""
+    _ensure_table()
+    if not DATABASE_URL:
+        return datetime.utcnow(), set()
     try:
-        if os.path.exists(WELCOMED_USERS_FILE):
-            with open(WELCOMED_USERS_FILE, "r") as fh:
-                data = json.load(fh)
-            start_time = datetime.fromisoformat(data["start_time"])
-            ids = set(data.get("ids", []))
-            logger.info("Loaded state: start_time=%s, welcomed=%d", start_time.isoformat(), len(ids))
-            return start_time, ids
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            # bot_start_time = earliest BOT_START marker, or now if first run
+            cur.execute(
+                "SELECT value FROM wpbot_messages WHERE template_name = 'BOT_START' ORDER BY sent_at ASC LIMIT 1"
+            )
+            row = cur.fetchone()
+            if row:
+                import json as _json
+                start_time = datetime.fromisoformat(_json.loads(row[0])["start_time"])
+            else:
+                start_time = datetime.utcnow()
+                cur.execute(
+                    "INSERT INTO wpbot_messages (template_name, params) VALUES ('BOT_START', %s)",
+                    (psycopg2.extras.Json({"start_time": start_time.isoformat()}),)
+                )
+            # welcomed_ids = all user_ids that received the welcome template
+            cur.execute(
+                "SELECT DISTINCT user_id FROM wpbot_messages WHERE user_id IS NOT NULL AND template_name <> 'BOT_START'"
+            )
+            ids = set(r[0] for r in cur.fetchall())
+        conn.close()
+        logger.info("Loaded state from DB: start_time=%s, welcomed=%d", start_time.isoformat(), len(ids))
+        return start_time, ids
     except Exception as exc:
-        logger.warning("Could not load state file (%s) – treating as fresh start", exc)
-    now = datetime.utcnow()
-    return now, set()
+        logger.warning("Could not load state from DB (%s) – treating as fresh start", exc)
+    return datetime.utcnow(), set()
+
+
+def _log_sent_message(user_id, phone: str, template_name: str, params: list, meta_message_id: str):
+    """Insert a row into bot_messages for every successfully sent message."""
+    if not DATABASE_URL:
+        return
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO wpbot_messages (user_id, phone, template_name, params, meta_message_id)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (user_id, phone, template_name,
+                 psycopg2.extras.Json(params), meta_message_id)
+            )
+        conn.close()
+    except Exception as exc:
+        logger.error("Could not log sent message: %s", exc)
 
 
 def _save_state(start_time: datetime, ids: set):
-    try:
-        with open(WELCOMED_USERS_FILE, "w") as fh:
-            json.dump({"start_time": start_time.isoformat(), "ids": list(ids)}, fh)
-    except Exception as exc:
-        logger.error("Could not save state: %s", exc)
+    """No-op: state is written per-message via _log_sent_message."""
+    pass
 
 
 bot_start_time, welcomed_ids = _load_state()
@@ -159,8 +221,8 @@ WELCOME_TEMPLATE_NAME = os.getenv("WELCOME_TEMPLATE_NAME", "wellcome")
 WELCOME_TEMPLATE_LANG = os.getenv("WELCOME_TEMPLATE_LANG", "en")
 
 
-def _post_to_meta(phone: str, payload: dict) -> bool:
-    """Send a payload to Meta WhatsApp Cloud API and log the full response."""
+def _post_to_meta(phone: str, payload: dict) -> str | None:
+    """Send a payload to Meta WhatsApp Cloud API. Returns meta_message_id on success, None on failure."""
     url = f"https://graph.facebook.com/v19.0/{META_PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {META_ACCESS_TOKEN}",
@@ -176,17 +238,22 @@ def _post_to_meta(phone: str, payload: dict) -> bool:
         if resp.status_code == 200:
             if isinstance(resp_body, dict) and resp_body.get("error"):
                 logger.error("❌ Meta returned 200 but with error: %s", resp_body["error"])
-                return False
-            logger.info("✅ Message sent to %s", phone)
-            return True
+                return None
+            meta_id = None
+            if isinstance(resp_body, dict):
+                messages = resp_body.get("messages", [])
+                if messages:
+                    meta_id = messages[0].get("id")
+            logger.info("✅ Message sent to %s (id=%s)", phone, meta_id)
+            return meta_id or "accepted"
         logger.error("❌ Meta API %s: %s", resp.status_code, resp_body)
-        return False
+        return None
     except Exception as exc:
         logger.error("❌ _post_to_meta exception: %s", exc)
-        return False
+        return None
 
 
-def send_template_message(phone: str, template_name: str, lang: str, params: list) -> bool:
+def send_template_message(phone: str, template_name: str, lang: str, params: list, user_id=None) -> bool:
     """Send an approved WhatsApp message template with body parameters."""
     if not META_ACCESS_TOKEN or not META_PHONE_NUMBER_ID:
         logger.error("Meta credentials not configured")
@@ -210,7 +277,11 @@ def send_template_message(phone: str, template_name: str, lang: str, params: lis
             ]
         }
     }
-    return _post_to_meta(phone, payload)
+    meta_id = _post_to_meta(phone, payload)
+    if meta_id:
+        _log_sent_message(user_id, phone, template_name, params, meta_id)
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +295,7 @@ def send_welcome(user: dict) -> bool:
         return False
     first_name = (user.get("first_name") or "there").strip()
     logger.info("Sending welcome to user id=%s phone=%s", user.get("id"), phone)
-    return send_template_message(phone, WELCOME_TEMPLATE_NAME, WELCOME_TEMPLATE_LANG, [first_name])
+    return send_template_message(phone, WELCOME_TEMPLATE_NAME, WELCOME_TEMPLATE_LANG, [first_name], user_id=user.get("id"))
 
 # ---------------------------------------------------------------------------
 # Poller – detect new sign-ups and welcome them
