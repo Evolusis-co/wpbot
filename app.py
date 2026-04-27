@@ -90,12 +90,11 @@ def _load_state() -> tuple:
         with conn.cursor() as cur:
             # bot_start_time = earliest BOT_START marker, or now if first run
             cur.execute(
-                "SELECT value FROM wpbot_messages WHERE template_name = 'BOT_START' ORDER BY sent_at ASC LIMIT 1"
+                "SELECT params FROM wpbot_messages WHERE template_name = 'BOT_START' ORDER BY sent_at ASC LIMIT 1"
             )
             row = cur.fetchone()
             if row:
-                import json as _json
-                start_time = datetime.fromisoformat(_json.loads(row[0])["start_time"])
+                start_time = datetime.fromisoformat(row[0]["start_time"])
             else:
                 start_time = datetime.utcnow()
                 cur.execute(
